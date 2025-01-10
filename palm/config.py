@@ -24,24 +24,24 @@ class PALMConfig(PretrainedConfig):
         pad_token_id=None, # Token ID used for padding sequences
         bos_token_id=128000, # Token ID for the beginning of a sequence
         eos_token_id=128001, # Token ID for the end of a sequence
-        tie_word_embeddings=True,
-        torch_dtype="bfloat16",
-        rope_scaling={
-            "factor": 32.0,
-            "high_freq_factor": 4.0,
-            "low_freq_factor": 1.0,
-            "original_max_position_embeddings": 8192,
-            "rope_type": "llama3"
+        tie_word_embeddings=True, # Enable tying input and output embeddings to reduce parameters
+        torch_dtype="bfloat16", # Use bfloat16 data type for efficient training and inference
+        rope_scaling={ # Configure RoPE (Rotary Position Embedding) scaling factors
+            "factor": 32.0, # General scaling factor for embeddings
+            "high_freq_factor": 4.0, # High-frequency scaling adjustment
+            "low_freq_factor": 1.0, # Low-frequency scaling adjustment
+            "original_max_position_embeddings": 8192, # Base sequence length for scaling
+            "rope_type": "llama3" 
         },
-        rope_theta=500000.0, 
-        use_cache=True,
-        attention_bias=False,
-        mlp_bias=False,
-        rms_norm_eps=1e-05,
+        rope_theta=500000.0, # Theta value for rotary embeddings, impacting periodicity
+        use_cache=True, # Enable caching for improved decoding efficiency
+        attention_bias=False, # Disable bias in attention layers for simplicity
+        mlp_bias=False, # Disable bias in MLP layers to reduce parameter count
+        rms_norm_eps=1e-05, # Small value to prevent division by zero in RMS normalization
         transformers_version="4.45.0.dev0",
-        architectures=["LlamaForCausalLM"],
-        sae_weight=0.5,
-        gradient_checkpointing=True,
+        architectures=["LlamaForCausalLM"], # Supported architectures for the model
+        sae_weight=0.5, # Weight for source-autoencoder attention loss
+        gradient_checkpointing=True, # Enable gradient checkpointing to save memory
         **kwargs
     ):
         # Call the parent class (PretrainedConfig) constructor with specific token IDs
