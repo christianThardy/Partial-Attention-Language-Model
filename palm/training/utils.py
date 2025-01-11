@@ -1,6 +1,6 @@
 import torch
 
-def collate_fn(batch):
+def collate_fn_instrcut(batch):
     # Initialize dictionaries to store the batched data
     batched_data = {
         "input_ids": [],
@@ -18,3 +18,62 @@ def collate_fn(batch):
         batched_data[key] = torch.stack(batched_data[key])
 
     return batched_data
+
+def collate_fn_base(batch):
+    # Identify all keys in the batch
+    keys = batch[0].keys()  # e.g. ["input_ids","attention_mask","labels","source_len"]
+    batched_data = {key: [item[key] for item in batch] for key in keys}
+    
+    # Convert lists to tensors
+    for key in batched_data:
+        # Force them to integer (long) Tensors
+        batched_data[key] = torch.tensor(batched_data[key], dtype=torch.long)
+
+    return batched_data
+
+def dataset_preprocessing(examples):
+    texts = examples["text"]
+    model_inputs = tokenizer(
+        texts,
+        max_length=MAX_SEQ_LENGTH,
+        truncation=True,
+        padding="max_length"
+    )
+    # 1) Create 'labels' from 'input_ids'
+    #    For causal LM tasks, a common quick approach is to just copy them
+    model_inputs["labels"] = [ids[:] for ids in model_inputs["input_ids"]]
+
+    # 2) Create 'source_len'. If you want half of each text
+    #    considered "source," do something like this:
+    pad_id = tokenizer.pad_token_id  # e.g. 128001
+    source_lengths = []
+    for i_ids in model_inputs["input_ids"]:
+        unpadded_len = sum(1 for t in i_ids if t != pad_id)
+        # For partial-attention, you might want half:
+        source_lengths.append(unpadded_len // 2)
+    model_inputs["source_len"] = source_lengths
+
+    return model_inputs
+
+def init_custom_layer_weights(module):
+    """
+    Recursively initialize custom layers (partial attention, lm/sae heads) 
+    to encourage faster learning from scratch.
+    """
+    for name, submodule in module.named_children():
+        # Initialize only "custom" modules or submodules you consider new. 
+        # This example checks partial attention & heads, skipping loaded pretrained weights.
+        if isinstance(submodule, PALMPartialAttention) or name in ["lm_head", "sae_head"]:
+            for param_name, param in submodule.named_parameters(recurse=False):
+                if "weight" in param_name and param.dim() >= 2:
+                    nn.init.xavier_uniform_(param)
+                elif "bias" in param_name:
+                    nn.init.zeros_(param)
+        else:
+            init_custom_layer_weights(submodule)
+
+def is_custom_param(param_name):
+    # Here, treat partial_attention, lm_head, sae_head, or 'Fp' submodule as custom
+    if any(x in param_name for x in ["partial_attention", "lm_head", "sae_head", "Fp"]):
+        return True
+    return False
