@@ -28,12 +28,13 @@ def main():
     # Create config
     config = PALMConfig(
         base_model_name=MODEL_NAME, 
-        hidden_dropout_prob=0.3, 
-        attention_probs_dropout_prob=0.3,
-        num_hidden_layers=10, 
-        num_attention_heads=10, 
-        hidden_size=750, 
-        layer_norm_eps=1e-5
+        hidden_dropout_prob=0.5, 
+        attention_probs_dropout_prob=0.5,
+        num_hidden_layers=28, 
+        num_attention_heads=24, 
+        hidden_size=3072, 
+        layer_norm_eps=1e-5,
+        sae_weight=0.5
     )
 
     # Create model
@@ -58,8 +59,13 @@ def main():
     train_dataloader, eval_dataloader = create_data_loaders(
         train_dataset, 
         eval_dataset, 
-        TRAIN_BATCH_SIZE, 
-        collate_fn
+        TRAIN_BATCH_SIZE,
+        EVAL_BATCH_SIZE,
+        shuffle=True,
+        collate_fn,
+        num_workers=12,
+        pin_memory=(device.type == "cuda"),
+        persistant_workers=True
     )
 
     # Initialize trainer
@@ -74,8 +80,8 @@ def main():
     trainer.train()
 
     # Save the final model
-    model.save_pretrained("PALM_model")
-    tokenizer.save_pretrained("PALM_model")
+    model.save_pretrained("pallm_llama_3.2-3B_")
+    tokenizer.save_pretrained("pallm_llama_3.2-3B_")
 
 
 if __name__ == "__main__":
