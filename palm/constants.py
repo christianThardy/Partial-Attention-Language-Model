@@ -9,3 +9,4 @@ NUM_TRAIN_EPOCHS = 4 # Number of times the entire dataset is passed through the 
 WARMUP_STEPS = 100 # Number of steps for gradually increasing the learning rate from 0 to the set value
 MAX_SEQ_LENGTH = 1024 # The maximum sequence length for input data; longer sequences will be truncated
 TRAIN_RATIO = 0.8 # The ratio of the dataset to be used for training; the remainder is used for validation/testing
+LOG_EVERY_N_STEPS = 1
