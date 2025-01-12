@@ -77,3 +77,16 @@ def is_custom_param(param_name):
     if any(x in param_name for x in ["partial_attention", "lm_head", "sae_head", "Fp"]):
         return True
     return False
+
+def freeze_selected_layers(model_, freeze_embeddings=True, freeze_up_to_layer_idx=0):
+    real_model = model_.module if hasattr(model_, 'module') else model_
+    if freeze_embeddings:
+        for param in real_model.embeddings.parameters():
+            param.requires_grad = False
+    for idx, layer in enumerate(real_model.layers):
+        for param in layer.parameters():
+            param.requires_grad = (idx >= freeze_up_to_layer_idx)
+    for param in real_model.lm_head.parameters():
+        param.requires_grad = True
+    for param in real_model.sae_head.parameters():
+        param.requires_grad = True
