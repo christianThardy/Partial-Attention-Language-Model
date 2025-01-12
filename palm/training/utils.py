@@ -31,30 +31,6 @@ def collate_fn_base(batch):
 
     return batched_data
 
-def dataset_preprocessing(examples):
-    texts = examples["text"]
-    model_inputs = tokenizer(
-        texts,
-        max_length=MAX_SEQ_LENGTH,
-        truncation=True,
-        padding="max_length"
-    )
-    # 1) Create 'labels' from 'input_ids'
-    #    For causal LM tasks, a common quick approach is to just copy them
-    model_inputs["labels"] = [ids[:] for ids in model_inputs["input_ids"]]
-
-    # 2) Create 'source_len'. If you want half of each text
-    #    considered "source," do something like this:
-    pad_id = tokenizer.pad_token_id  # e.g. 128001
-    source_lengths = []
-    for i_ids in model_inputs["input_ids"]:
-        unpadded_len = sum(1 for t in i_ids if t != pad_id)
-        # For partial-attention, you might want half:
-        source_lengths.append(unpadded_len // 2)
-    model_inputs["source_len"] = source_lengths
-
-    return model_inputs
-
 def init_custom_layer_weights(module):
     """
     Recursively initialize custom layers (partial attention, lm/sae heads) 
