@@ -5,6 +5,7 @@ import torch
 from torch.optim import AdamW
 
 from transformers import get_linear_schedule_with_warmup
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from tqdm import tqdm
 import wandb
@@ -25,16 +26,26 @@ class PALMTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Determine whether to use GPU or CPU
         self.model.to(self.device) # Move model to the selected device
         
-        # Initialize optimizer with AdamW, including learning rate and weight decay
-        self.optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.09)
+        # Initialize optimizer with AdamW, including differential learning rates and weight decay
+        optimizer = torch.optim.AdamW([
+            {"params": pretrained_params, "lr": PRETRAINED_LR, "weight_decay": 0.01},
+            {"params": custom_params, "lr": CUSTOM_LR, "weight_decay": 0.09},
+        ])
         
         # Set up learning rate scheduler with a linear warm-up and total training steps
-        self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=config.warmup_steps,
-            num_training_steps=len(train_dataloader) * config.num_train_epochs // config.gradient_accumulation_steps
-        )
-        # Initialize global step counter to zero.
+        # self.scheduler = get_linear_schedule_with_warmup(
+        #     self.optimizer,
+        #     num_warmup_steps=config.warmup_steps,
+        #     num_training_steps=len(train_dataloader) * config.num_train_epochs // config.gradient_accumulation_steps
+        # )
+        total_steps = len(train_dataloader) * NUM_TRAIN_EPOCHS // GRADIENT_ACCUMULATION_STEPS
+        self.scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps, # Total number of steps for annealing
+            eta_min=1e-4 # Minimum learning rate at the end of annealing
+            )
+        # Initialize global step counter to zero
+        start_time = time.time()
         self.global_step = 0
         
     # Define training process over multiple epochs
