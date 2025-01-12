@@ -3,9 +3,10 @@ import logging
 
 import torch
 from torch.optim import AdamW
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from transformers import get_linear_schedule_with_warmup
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from tqdm import tqdm
 import wandb
@@ -36,9 +37,9 @@ class PALMTrainer:
         # self.scheduler = get_linear_schedule_with_warmup(
         #     self.optimizer,
         #     num_warmup_steps=config.warmup_steps,
-        #     num_training_steps=len(train_dataloader) * config.num_train_epochs // config.gradient_accumulation_steps
+        #     num_training_steps=len(self.train_dataloader) * config.num_train_epochs // config.gradient_accumulation_steps
         # )
-        total_steps = len(train_dataloader) * NUM_TRAIN_EPOCHS // GRADIENT_ACCUMULATION_STEPS
+        total_steps = len(self.train_dataloader) * NUM_TRAIN_EPOCHS // GRADIENT_ACCUMULATION_STEPS
         self.scheduler = CosineAnnealingLR(
             optimizer,
             T_max=total_steps, # Total number of steps for annealing
@@ -64,58 +65,113 @@ class PALMTrainer:
         total_correct = 0  # Initialize the total number of correct predictions
         total_predictions = 0  # Initialize the total number of predictions
         start_time = time.time() # Record start time for the epoch
-        
-        # Loop through each batch of data in the training data loader, with a progress bar
-        for step, batch in enumerate(tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")):
-            try:
-                # Move input IDs, attention mask, labels, and source lengths to the device
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                source_len = batch["source_len"].to(self.device)
-                
-                # Perform a forward pass to compute logits and losses
-                # Weird, does not seem like lm_logits is being used downstream
-                lm_logits, combined_loss, loss, sae_loss = self.model(
-                    input_ids, 
-                    attention_mask=attention_mask, 
-                    labels=labels, 
-                    source_len=source_len
-                )
 
-                # Compute accuracy
-                preds = lm_logits.argmax(dim=-1)  # Get the index of the highest logit for each token
-                correct = (preds == labels).float() * attention_mask  # Compare predictions to labels
-                total_correct += correct.sum().item()  # Sum the correct predictions
-                total_predictions += attention_mask.sum().item()  # Sum the number of tokens predicted
-                
-                # Calculate and log accuracy
-                accuracy = total_correct / total_predictions  # Compute the accuracy
+        # Early stopping variables
+        best_eval_loss = float("inf")
+        no_improvement_steps = 0
+        patience = 3
 
-                # Scale combined loss for gradient accumulation
-                combined_loss = combined_loss / self.config.gradient_accumulation_steps
-                combined_loss.backward()
-                
-                # Accumulate total loss for logging
-                total_loss += loss.item()
-                
-                # Update model parameters if the step is at the accumulation point or the last step
-                if (step + 1) % self.config.gradient_accumulation_steps == 0 or step == len(self.train_dataloader) - 1:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5) # Clip gradients to avoid exploding gradients
-                    self.optimizer.step() # Update the model parameters
-                    self.scheduler.step() # Update the learning rate
-                    self.optimizer.zero_grad() # Zero the gradients for the next step
-                    self.global_step += 1 # Increment the global step counter
+        # Freeze schedule: Start with all pretrained layers frozen except final layer
+        # then unfreeze more layers halfway through
+        NUM_LAYERS = real_model.config.num_hidden_layers
+        FREEZE_SCHEDULE = [
+            {"epoch": 0, "freeze_embeddings": True,  "freeze_up_to_layer_idx": (NUM_LAYERS // 2)},
+            {"epoch": 1, "freeze_embeddings": True,  "freeze_up_to_layer_idx": (NUM_LAYERS // 4)},
+            {"epoch": 2, "freeze_embeddings": False, "freeze_up_to_layer_idx": 0},
+        ]
+        # Initialize with the first schedule stage
+        initial_schedule = FREEZE_SCHEDULE[0]
+        freeze_selected_layers(model, freeze_embeddings=initial_schedule["freeze_embeddings"],
+                               freeze_up_to_layer_idx=initial_schedule["freeze_up_to_layer_idx"])
+
+        for epoch in range(NUM_TRAIN_EPOCHS):
+            # Check if we should switch freeze settings at this epoch
+            for schedule_stage in FREEZE_SCHEDULE:
+                if epoch == schedule_stage["epoch"]:
+                    freeze_selected_layers(
+                        model,
+                        freeze_embeddings=schedule_stage["freeze_embeddings"],
+                        freeze_up_to_layer_idx=schedule_stage["freeze_up_to_layer_idx"]
+                    )
+                    logger.info(f"Selective freezing activated at epoch {epoch}. "
+                                f"Embeddings frozen: {schedule_stage['freeze_embeddings']}, "
+                                f"Layers up to idx {schedule_stage['freeze_up_to_layer_idx']} are frozen.")
+            model.train()
+            
+            # Loop through each batch of data in the training data loader
+            for step, batch in enumerate(tqdm(self.train_dataloader, desc=f"Epoch {epoch+1}")):
+                print(f"Processing batch {step+1}")
+                try:
+                    print("Moving batch to device")
+                    # Move input IDs, attention mask, labels, and source lengths to the device
+                    input_ids = batch["input_ids"].to(self.device)
+                    attention_mask = batch["attention_mask"].to(self.device)
+                    labels = batch["labels"].to(self.device)
+                    source_len = batch["source_len"].to(self.device)
+
+                    print("Batch moved to device")
+                    print("f"Shapes - input_ids: {input_ids.shape}, attention_mask: {attention_mask.shape}, labels: {labels.shape}")
+
+                    print("Memory usage before forward pass:")
+                    for i in range(torch.cuda.device_count()):
+                        print(f"GPU {i}: {torch.cuda.memory_allocated(i) / 1e9:.2f} GB / {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB")
+
+                    print("Starting forward pass")
+                    device_type_str = "cuda" if device.type == "cuda" else "cpu"
+                    with torch.amp.autocast(device_type=device_type_str, enabled=(device.type == "cuda")):
+                    
+                        # Perform a forward pass to compute logits and losses
+                        lm_logits, combined_loss, loss, sae_loss = self.model(
+                            input_ids, 
+                            attention_mask=attention_mask, 
+                            labels=labels, 
+                            source_len=source_len
+                        )
+
+                        combined_loss = loss + sae_loss if (loss is not None and sae_loss is not None) else None
+
+                    # Compute accuracy
+                    preds = lm_logits.argmax(dim=-1)  # Get the index of the highest logit for each token
+                    correct = (preds == labels).float() * attention_mask  # Compare predictions to labels
+                    total_correct += correct.sum().item()  # Sum the correct predictions
+                    total_predictions += attention_mask.sum().item()  # Sum the number of tokens predicted
+                    # Calculate accuracy
+                    accuracy = total_correct / total_predictions
+                    
+                    if combined_loss is not None:
+                        has_fp32_params = any(p.dtype == torch.float32 for p in model.parameters())
+                        scaler = torch.amp.GradScaler(enabled=(device.type == "cuda" and has_fp32_params))
+                        # Scale combined loss for gradient accumulation
+                        combined_loss = combined_loss / self.config.gradient_accumulation_steps
+                        print("Starting backward pass")
+                        # Added for mixed precision
+                        scaler.scale(combined_loss).backward()
+                        print("Backward pass complete")
+                        print("Computing total loss")
+                        total_loss += loss.item()
+                        total_sae_loss += sae_loss.item() if sae_loss is not None else 0
+                        print("Total loss complete:", total_loss)
+                        print("SAE loss complete:", total_sae_loss)
+                    
+                    # Update model parameters if the step is at the accumulation point or the last step
+                    if (step + 1) % self.config.gradient_accumulation_steps == 0 or step == len(self.train_dataloader) - 1:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0) # Clip gradients to avoid exploding gradients
+                        scaler.unscale_(self.optimizer) # Added for mixed precision
+                        scaler.step(self.optimizer) # Update the model parameters
+                        scaler.update()
+                        self.optimizer.zero_grad() # Zero the gradients for the next step
+                        self.scheduler.step() # Update the learning rate
+                        self.global_step += 1 # Increment the global step counter
                  
-                # Log metrics at specified intervals
-                if step % self.config.logging_steps == 0:
-                    self.log_metrics(loss, sae_loss, combined_loss, start_time, accuracy) # Log the metrics
-                    start_time = time.time() # Reset the start time for the next logging interval
+                        # Log metrics at specified intervals
+                        if step % self.config.logging_steps == 0:
+                            self.log_metrics(accuracy, train_loss, sae_loss, combined_loss, learning_rate, start_time) # Log the metrics
+                            start_time = time.time() # Reset the start time for the next logging interval
                 
-            except Exception as e:
-                logger.error(f"Error in training loop: {str(e)}")
-                logger.error(f"Batch contents: {batch}")
-                raise
+                except Exception as e:
+                    logger.error(f"Error in training loop: {str(e)}")
+                    logger.error(f"Batch contents: {batch}")
+                    raise                                                    
                 
     def evaluate(self):
         # Set model to evaluation mode
