@@ -30,14 +30,15 @@ class PALMIntermediate(nn.Module):
         super().__init__()
         # Linear layer to project hidden states to a larger intermediate size
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        
         # Activation function (GELU) to introduce non-linearity
         self.intermediate_act_fn = nn.GELU()
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states):
         # Apply linear transformation and activation function to the hidden states
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.dropout(hidden_states)
         return hidden_states
     
 
@@ -81,20 +82,34 @@ class PALMLayer(nn.Module):
         self.output = PALMOutput(config)
 
     def forward(self, hidden_states, attention_mask=None):
-        # Apply attention mechanism
-        attention_output = self.attention(hidden_states, attention_mask)
-
-        # Apply partial attention using a subset of the hidden states
-        partial_attention_output = self.partial_attention(
-            attention_output,
-            hidden_states[:, :self.config.fixed_source_length],
-            attention_mask
+        # Standard self-attention (the "ATTl" block in the paper)
+        attention_output = self.attention(
+            hidden_states, 
+            attention_mask=attention_mask
         )
-        # Process output of the partial attention with the intermediate layer
-        intermediate_output = self.intermediate(partial_attention_output)
 
-        # Apply output layer to produce the final output for this layer
+        # Apply partial attention using a subset of the hidden states 
+        # (focusing only on the source portion)
+        partial_attention_output = self.partial_attention(
+            hidden_states=attention_output,
+            source_states=attention_output,
+            source_len=source_len,
+            attention_mask=attention_mask
+        )
+        
+        # Process output of the intermediate layer with the partial attention
+        intermediate_output = self.intermediate(partial_attention_output)
         layer_output = self.output(intermediate_output, partial_attention_output)
+
+        # Clean up any leftover NaNs
+        if not torch.isfinite(layer_output).all():
+            layer_output = torch.where(
+                torch.isfinite(layer_output),
+                layer_output,
+                torch.zeros_like(layer_output)
+            )
+            logger.warning("Non-finite values detected in final PALMLayer output, zeroing them")
+            
         return layer_output
     
 
@@ -109,41 +124,53 @@ class PALMModel(nn.Module):
         # Stack of transformer layers
         self.layers = nn.ModuleList([PALMLayer(config) for _ in range(config.num_hidden_layers)])
         
-        # Linear layer for language modeling head
+        # Linear layers for language modeling, source autoencoding heads
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
-        # Linear layer for sequence autoencoding head
         self.sae_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
-        # Weight for combining SAE loss
-        self.sae_weight = config.sae_weight if hasattr(config, 'sae_weight') else 0.5  # Weight for SAE loss
+        # Scale embeddings by sqrt(d_model)
+        self.embed_scale = math.sqrt(config.hidden_size)
+       
+        # Initialize weights with proper scaling
+        self._init_weights()
+       
+        self.gradient_checkpointing = config.gradient_checkpointing
 
-    def create_bidirectional_attention_mask(self, input_ids):
-        seq_length = input_ids.size(1)
-        batch_size = input_ids.size(0)
+    def _init_weights(self):
+        # Initialize embedding weights
+        nn.init.normal_(self.embeddings.word_embeddings.weight, mean=0.0,
+                       std=0.02/math.sqrt(2 * self.config.num_hidden_layers))
+       
+        # Initialize output heads
+        nn.init.normal_(self.lm_head.weight, mean=0.0,
+                       std=0.02/math.sqrt(2 * self.config.num_hidden_layers))
+        nn.init.normal_(self.sae_head.weight, mean=0.0,
+                       std=0.02/math.sqrt(2 * self.config.num_hidden_layers))
+
+    def create_bidirectional_attention_mask(self, input_ids, source_len):
+        batch_size, seq_length = input_ids.size()
     
         # Create a mask for bidirectional attention on the source sequence and causal attention on the target
         mask = torch.zeros((batch_size, 1, seq_length, seq_length), device=input_ids.device)
     
-        # Define length of the source sequence (minimum of seq_length and fixed_source_length)
-        actual_source_length = min(seq_length, self.config.fixed_source_length)
+        # Define length of the source sequence
+        source_len = min(source_len, seq_length)
     
         # Apply bidirectional attention to the source sequence
-        mask[:, :, :actual_source_length, :actual_source_length] = 1
+        mask[:, :, :source_len, :source_len] = 1
     
-        # If sequence is longer than source length, add causal mask for the target sequence
+        # If source is shorter than sequence length, add causal mask for the target sequence
         # Apply causal attention to the target sequence
-        if seq_length > actual_source_length:
-            causal_mask = torch.tril(torch.ones((seq_length - actual_source_length, seq_length - actual_source_length), device=input_ids.device))
-            mask[:, :, actual_source_length:, actual_source_length:] = causal_mask
-    
-        # Allow target sequence to attend to all of source sequence
-        mask[:, :, actual_source_length:, :actual_source_length] = 1
+        if source_length < seq_length:
+            target_length = seq_length - source_len
+            causal_mask = torch.tril(torch.ones((target_length, target_length), device=input_ids.device))
+            mask[:, :, source_length:, source_length:] = causal_mask
+            # Allow target sequence to attend to all of source sequence
+            mask[:, :, source_length:, :source_length] = 1
     
         # Convert the mask to a form suitable for additive attention
         # So convert 0s to -10000.0 and 1s to 0.0
         mask = (1.0 - mask) * -10000.0
-    
         return mask
 
     def forward(self, input_ids, attention_mask=None, labels=None, source_len=None):
