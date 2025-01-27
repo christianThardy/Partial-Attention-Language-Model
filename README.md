@@ -1,8 +1,8 @@
 # Partial Attention Large Language Model
 
-This ongoing implementation of **PALLM** is a wrapper on top of HuggingFace to take the strong foundation and simplicity of decoder-only models and enhance them to capture rich contextual representations, like encoder-decoder models. This is made possible through a partial attention mechanism, which selectively attends to different segments of the input text (source) rather than applying a uniform attention across the entire sequence. 
+This ongoing implementation of **PALLM** is a wrapper on top of HuggingFace models to take the strong foundation and simplicity of decoder-only models and enhance them to capture rich contextual representations, like encoder-decoder models. This is made possible through a partial attention mechanism, which selectively attends to different segments of the input text rather than applying a uniform attention across the entire sequence. 
 
-It decreases the effects of attention degeneration as seen in the hallucination problem via a bidirectional attention mask, a separate positional encoding and a specialized language embedding to help the model differentiate between source (prompt) and target (generated output) text sequences. This version of PALLM is different from the original paper as it encourages the model to reconstruct and attend to the input via a source-autoencoder (SAE) objective. 
+It decreases the effects of attention degeneration as seen in the hallucination problem via a bidirectional attention mask (mechanism to enhance source understanding), a separate positional encoding/specialized language embedding (mechanisms for source-target discrimination) to help the model differentiate between source (prompt) and target (generated output) text sequences. This version of PALLM is different from the original paper as it encourages the model to reconstruct and attend to the input via a source-autoencoder (SAE) objective (mechanism to enforce source grounding). 
 
 By encouraging the model to reconstruct and attend to the input, it stays tethered to the source content during generation. PALM allows:
 
