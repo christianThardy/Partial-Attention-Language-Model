@@ -2,26 +2,25 @@
 import os
 import logging
 
-from attention import PALMAttention, PALMPartialAttention
-from embeddings import PALMEmbeddings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file as safe_save_file
 
+from attention import PALMAttention, PALMPartialAttention
+from embeddings import PALMEmbeddings
+
 import glob
 
 # Logger object
 logger = logging.getLogger()
-# Set the level of the logger. Possible values: DEBUG, INFO, WARNING, ERROR, CRITICAL
+# Level of the logger. Values: DEBUG, INFO, WARNING, ERROR, CRITICAL
 logger.setLevel(logging.DEBUG)
-# Handler that writes log messages to the notebook's output
+# Handler writes log messages to the notebook's output
 handler = logging.StreamHandler()
 # Set the format for the log messages
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
-# Add the handler to the logger
 logger.addHandler(handler)
 
 
@@ -72,7 +71,7 @@ class PALMLayer(nn.Module):
         # Attention mechanism
         self.attention = PALMAttention(config)
 
-        # Partial attention mechanism for handling specific input sequences
+        # Partial attention mechanism for handling source input sequences
         self.partial_attention = PALMPartialAttention(config)
 
         # Intermediate layer for processing the attention output
@@ -243,7 +242,11 @@ class PALMModel(nn.Module):
                   f"labels: {labels.shape if isinstance(labels, torch.Tensor) else 'not a tensor'},")
             raise
 
-    def generate(self, input_ids, max_length=None, min_length=None, do_sample=True, temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0, pad_token_id=None, eos_token_id=None, attention_mask=None, **kwargs):
+    def generate(
+        self, input_ids, max_length=None, min_length=None, do_sample=True, temperature=1.0, 
+        top_k=50, top_p=1.0, repetition_penalty=1.0, pad_token_id=None, eos_token_id=None, 
+        attention_mask=None, **kwargs
+    ):
         # Set default values for generation parameters
         max_length = max_length if max_length is not None else self.config.max_length
         min_length = min_length if min_length is not None else self.config.min_length
@@ -363,8 +366,11 @@ class PALMModel(nn.Module):
 
         return logits
     
-    def save_pretrained(self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, push_to_hub=False, max_shard_size="5GB", safe_serialization=True, variant=None, token=None, save_peft_format=True, **kwargs):
-        """Save a model and its configuration file to a directory, so that it can be re-loaded using the `from_pretrained` class method."""
+    def save_pretrained(
+        self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, push_to_hub=False, 
+        max_shard_size="5GB", safe_serialization=True, variant=None, token=None, save_peft_format=True, **kwargs):
+        """Save a model and its configuration file to a directory, so that it can be re-loaded using the 
+        `from_pretrained` class method."""
         if not is_main_process:
             return None
 
