@@ -174,65 +174,44 @@ class PALMModel(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, labels=None, source_len=None):
         try:
-            # Ensure input_ids is a tensor and has the correct dimensions
-            input_ids = torch.tensor(input_ids) if not isinstance(input_ids, torch.Tensor) else input_ids
-            if input_ids.dim() == 1:
-                input_ids = input_ids.unsqueeze(0)  # Add batch dimension
-            
-            # Create or validate attention mask
-            if attention_mask is None:
-                attention_mask = self.create_bidirectional_attention_mask(input_ids)
-            else:
-                attention_mask = torch.tensor(attention_mask) if not isinstance(attention_mask, torch.Tensor) else attention_mask
-                if attention_mask.dim() == 1:
-                    attention_mask = attention_mask.unsqueeze(0)  # Add batch dimension
+            # Create input ids, attention mask and labels
+            input_ids = self._validate_input(input_ids)
+            attention_mask = self._prepare_attention_mask(input_ids, attention_mask)
+            labels = self._prepare_labels(input_ids, labels)
+
+            # If source_len isn't specified, treat entire seq_length as source
+            if source_len is not None:
+                batch_size, seq_len = input_ids.shape
+                device_ = input_ids.device
+                source_len = torch.full(
+                    (batch_size,),
+                    seq_len,
+                    dtype=torch.long,
+                    device=device_
+                )
+
+            hidden_states = self.embeddings(input_ids, source_len=source_len)
+            hidden_states = hidden_states * self.embed_scale
     
-            # Ensure labels are tensors and have the correct dimensions
-            if labels is not None:
-                labels = torch.tensor(labels) if not isinstance(labels, torch.Tensor) else labels
-                if labels.dim() == 1:
-                    labels = labels.unsqueeze(0)  # Add batch dimension
-    
-            # Embedding lookup
-            #print("Forward pass: Starting embeddings")
-            hidden_states = self.embeddings(input_ids)
-            #print("Forward pass: Embeddings complete")
-    
-            # Pass through each layer
-            for layer in self.layers:
-                #print(f"Forward pass: Starting layer {layer}")
-                hidden_states = layer(hidden_states, attention_mask)
-                #print(f"Forward pass: Layer {layer} complete")
-    
-            # Compute logits for language modeling
-            #print("Forward pass: Starting lm_head")
+            for layer_module in self.layers:
+                if self.gradient_checkpointing and self.training:
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        layer_module, hidden_states, attention_mask, source_len
+                    )
+                else:
+                    hidden_states = layer_module(hidden_states, attention_mask, source_len)
+
+                if not torch.isfinite(hidden_states).all():
+                    raise ValueError("NaN or Inf detected in hidden_states")
+
+            # Use entire hidden_states for sae_head, not slicing
             lm_logits = self.lm_head(hidden_states)
-            #print("Forward pass: lm_head complete")
+            sae_logits = self.sae_head(hidden_states)  # shape [B, T, vocab_size]
 
-            # Compute logits for sequence autoencoding
-            #print("Forward pass: Starting sae_head")
-            sae_logits = self.sae_head(hidden_states[:, :self.config.fixed_source_length])
-            #print("Forward pass: sae_head complete")
-
-            # Initialize loss variables
-            loss = None
-            sae_loss = None
-            combined_loss = None
-            
-            # Compute loss if labels are provided
-            if labels is not None:
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
-                #print(f"Forward pass: Loss calculated: {loss.item()}")
-
-                # Calculate SAE loss if source length is provided
-                if source_len is not None:
-                    sae_labels = input_ids[:, :self.config.fixed_source_length]
-                    sae_loss = loss_fct(sae_logits.view(-1, self.config.vocab_size), sae_labels.reshape(-1))
-
-                # Combine losses
-                combined_loss = loss + self.sae_weight * sae_loss
-                
+            # Compute losses with per‐sample mask
+            loss, sae_loss, combined_loss = self._compute_loss(
+                lm_logits, sae_logits, labels, source_len
+            )  
             return lm_logits, combined_loss, loss, sae_loss   
     
         except Exception as e:
@@ -242,11 +221,98 @@ class PALMModel(nn.Module):
                   f"labels: {labels.shape if isinstance(labels, torch.Tensor) else 'not a tensor'},")
             raise
 
+    def _validate_input(self, input_ids):
+        if not isinstance(input_ids, torch.Tensor):
+            input_ids = torch.tensor(input_ids)
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        if hasattr(self, 'module'):
+            device = next(self.module.parameters()).device
+        else:
+            try:
+                device = next(self.parameters()).device
+            except StopIteration:
+                pass
+        return input_ids.to(device)
+
+    def _prepare_attention_mask(self, input_ids, attention_mask):
+        if attention_mask is None:
+            attention_mask = self.create_bidirectional_attention_mask(input_ids, input_ids.size(1))
+        return attention_mask.to(input_ids.device)
+
+    def _prepare_labels(self, input_ids, labels):
+        if labels is not None:
+            if not isinstance(labels, torch.Tensor):
+                labels = torch.tensor(labels)
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+            return labels.to(input_ids.device)
+        return None
+
+    # Do a per‐sample masked loss for SAE
+    def _compute_loss(self, lm_logits, sae_logits, labels, source_len):
+        """
+        Implementation for each sample's source_len. Create a mask that selects
+        only [0..source_len[i]-1] per batch example for the SAE loss.
+        """
+        if labels is None:
+            return None, None, None
+
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+        device_type_ = lm_logits.device.type
+
+        with torch.amp.autocast(device_type=device_type_, enabled=False):
+            lm_logits = lm_logits.float()
+            sae_logits = sae_logits.float()
+            labels = labels.long()
+
+            # 1) Normal LM loss over all tokens
+            loss = loss_fct(
+                lm_logits.view(-1, lm_logits.size(-1)),
+                labels.view(-1)
+            )
+            # Build a boolean mask for each sample's source portion
+            B, T, _ = sae_logits.shape   # e.g. [8, 1024, vocab_size]
+            range_tensor = torch.arange(T, device=labels.device).unsqueeze(0)  # shape [1, T]
+            # shape [B, T], True if j < source_len[i], else False
+            mask = range_tensor < source_len.unsqueeze(1)
+
+            # Create a copy of labels for SAE, ignoring positions beyond source_len
+            sae_labels = labels.clone()
+            sae_labels[~mask] = -100  # set them to ignore_index
+            sae_loss = loss_fct(
+                sae_logits.view(-1, sae_logits.size(-1)),
+                sae_labels.view(-1)
+            )
+            
+        # Zero out inf/nan
+        if not torch.isfinite(loss):
+            logger.warning("Loss is non-finite; zeroing it out.")
+            loss = torch.zeros(1, device=loss.device, dtype=loss.dtype)
+        if not torch.isfinite(sae_loss):
+            logger.warning("SAE loss is non-finite; zeroing it out.")
+            sae_loss = torch.zeros(1, device=sae_loss.device, dtype=sae_loss.dtype)
+
+        sae_weight = getattr(self.config, 'sae_weight', 0.5)
+        combined_loss = loss + sae_weight * sae_loss
+
+        if not torch.isfinite(combined_loss):
+            logger.warning("Combined loss is non-finite; zeroing it out.")
+            combined_loss = torch.zeros(1, device=combined_loss.device, dtype=combined_loss.dtype)
+
+        if not torch.isfinite(combined_loss):
+            raise ValueError("Combined loss is NaN or Inf")
+
+        return loss, sae_loss, combined_loss
+
     def generate(
         self, input_ids, max_length=None, min_length=None, do_sample=True, temperature=1.0, 
         top_k=50, top_p=1.0, repetition_penalty=1.0, pad_token_id=None, eos_token_id=None, 
         attention_mask=None, **kwargs
     ):
+        """Generate method with improved memory efficiency and vectorized operations."""
         # Set default values for generation parameters
         max_length = max_length if max_length is not None else self.config.max_length
         min_length = min_length if min_length is not None else self.config.min_length
@@ -254,88 +320,93 @@ class PALMModel(nn.Module):
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
 
         # Ensure input_ids are on the correct device
-        device = next(self.parameters()).device
-        input_ids = input_ids.to(device)
+        dev = next(self.parameters()).device
+        input_ids = input_ids.to(dev, non_blocking=True)
 
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = self.create_bidirectional_attention_mask(input_ids)
+        batch_size, seq_len = input_ids.shape
+        cumulative_attention_mask = torch.zeros(
+            (batch_size, 1, max_length, max_length),
+            device=dev,
+            dtype=torch.bool
+        )
+        cumulative_attention_mask[:, :, :seq_len, :seq_len] = True
         
         # Initialize sequence tracking and keep track of which sequences are already finished
-        unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+        unfinished_sequences = torch.ones(batch_size, device=dev, dtype=torch.long)
         
         # Initialize generated sequence with the input sequence
         generated_sequence = input_ids
+        
+        next_tokens = torch.zeros(batch_size, device=dev, dtype=torch.long)
 
-        while True:
-            # Prepare model inputs
+        for _ in range(max_length - seq_len):
+            current_length = generated_sequence.size(1)
+            cumulative_attention_mask[:, :, current_length-1, :current_length] = True
+
+
             model_inputs = {
                 "input_ids": generated_sequence,
-                "attention_mask": attention_mask,
+                "attention_mask": cumulative_attention_mask[:, :, :current_length, :current_length]
             }
 
-            # Forward pass without gradients
-            with torch.no_grad():
+            # Specify device_type for autocast
+            generation_device_type = dev.type
+            with torch.no_grad(), torch.amp.autocast(device_type=generation_device_type,
+                                                     enabled=(generation_device_type == "cuda")):
                 outputs = self(**model_inputs)
-            
-            # Get the next token logits
-            next_token_logits = outputs[0][:, -1, :]
+                next_token_logits = outputs[0][:, -1, :]
 
-            # Adjust logits for generation
-            next_token_logits = self.adjust_logits_during_generation(
-                next_token_logits,
-                cur_len=generated_sequence.shape[1],
-                max_length=max_length,
-                min_length=min_length,
-                repetition_penalty=repetition_penalty,
-                input_ids=generated_sequence
+                next_token_logits = self.adjust_logits_during_generation(
+                    next_token_logits,
+                    current_length,
+                    max_length,
+                    min_length,
+                    repetition_penalty,
+                    generated_sequence
+                )
+                next_token_logits.div_(temperature)
+                next_token_logits = self.top_k_top_p_filtering(
+                    next_token_logits,
+                    top_k=top_k,
+                    top_p=top_p
+                )
+                if do_sample:
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    next_tokens = next_token_logits.argmax(dim=-1)
+
+            next_tokens = torch.where(
+                unfinished_sequences.bool(),
+                next_tokens,
+                pad_token_id * torch.ones_like(next_tokens)
             )
+            unfinished_sequences.mul_((next_tokens != eos_token_id).long())
 
-            # Apply temperature
-            next_token_logits = next_token_logits / temperature
+            generated_sequence = torch.cat([
+                generated_sequence,
+                next_tokens.unsqueeze(-1)
+            ], dim=-1)
 
-            # Apply top-k and top-p filtering
-            next_token_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
-
-            # Sample next token
-            if do_sample:
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_logits, dim=-1)
-
-            # Handle finished sequences
-            # Finished sentences should have their next token be a padding token
-            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            # Update unfinished sequences
-            unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
-
-            # Append next tokens to the sequence
-            generated_sequence = torch.cat([generated_sequence, next_tokens.unsqueeze(-1)], dim=-1)
-
-            # Update attention mask
-            new_attention_mask = self.create_bidirectional_attention_mask(generated_sequence)
-            attention_mask = new_attention_mask
-
-            # Stop if we've reached max_length or all sequences are finished
-            if unfinished_sequences.max() == 0 or generated_sequence.shape[1] >= max_length:
+            if unfinished_sequences.max() == 0:
                 break
-
         return generated_sequence
     
     def adjust_logits_during_generation(self, logits, cur_len, max_length, min_length, repetition_penalty, input_ids):
-        """Adjust token logits during generation."""
+        """Adjust token logits during generation. Optimized adjustment with vectorized operations."""
         # Apply repetition penalty
         if repetition_penalty != 1.0:
-            for i in range(input_ids.shape[0]):
-                for previous_token in set(input_ids[i].tolist()):
-                    # If score < 0 then repetition penalty has to multiply it by repetition penalty
-                    if logits[i, previous_token] < 0:
-                        logits[i, previous_token] *= repetition_penalty
-                    else:
-                        logits[i, previous_token] /= repetition_penalty
-
+            # Vectorized repetition penalty application
+            unique_tokens = torch.unique(input_ids)
+            logits.scatter_(
+                1,
+                unique_tokens.unsqueeze(0).expand(logits.size(0), -1),
+                torch.where(
+                    logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) < 0,
+                    logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) * repetition_penalty,
+                    logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) / repetition_penalty
+                )
+            )
         # Prevent generation of tokens before min_length
         if cur_len < min_length:
             logits[:, self.config.eos_token_id] = float('-inf')
@@ -347,8 +418,9 @@ class PALMModel(nn.Module):
         if top_k > 0:
             top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
             # Remove all tokens with a probability less than the last token of the top-k
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = filter_value
+            topk_values, _ = torch.topk(logits, top_k)
+            indices_to_remove = logits < topk_values[..., -1, None]
+            logits.masked_fill_(indices_to_remove, filter_value)
 
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -361,9 +433,10 @@ class PALMModel(nn.Module):
             sorted_indices_to_remove[..., 0] = 0
 
             # Scatter sorted tensors to original indexing
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = filter_value
-
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+            logits.masked_fill_(indices_to_remove, filter_value)
+            
         return logits
     
     def save_pretrained(
@@ -379,82 +452,90 @@ class PALMModel(nn.Module):
 
         os.makedirs(save_directory, exist_ok=True)
 
-        # Get state_dict
-        if state_dict is None:
-            state_dict = self.state_dict()
+        # Validate configuration
+        if not hasattr(self, 'config'):
+            raise AttributeError("Model doesn't have a config attribute")
 
-        # Handle the case for DataParallel
-        if hasattr(self, 'module'):
-            state_dict = self.module.state_dict()
+        # Efficient state dict handling
+        state_dict = state_dict or (
+            self.module.state_dict() if hasattr(self, 'module') else self.state_dict()
+        )
+        
+        # Set up LFS tracking for large files
+        with open(os.path.join(save_directory, '.gitattributes'), 'w') as f:
+            f.write('*.bin filter=lfs diff=lfs merge=lfs -text\n')
+            f.write('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
+        
+        # Optimize file saving with sharding support
+        if safe_serialization:
+            from safetensors.torch import save_file
+            save_file(
+                state_dict,
+                os.path.join(save_directory, 'model.safetensors'),
+                metadata={"format": "pt"}
+            )
+        else:
+            if max_shard_size and max_shard_size != "5GB":
+                from transformers.modeling_utils import shard_checkpoint
+                sharded_state_dict = shard_checkpoint(state_dict, max_shard_size=max_shard_size)
+                for shard_file, shard in sharded_state_dict.items():
+                    save_function(shard, os.path.join(save_directory, shard_file))
+            else:
+                save_function(
+                    state_dict,
+                    os.path.join(save_directory, 'pytorch_model.bin')
+                )
 
-        # Save model
+        # Save model config if available
         model_to_save = self.module if hasattr(self, 'module') else self
-
-        # Implement model weight sharding if max_shard_size is specified
-        if max_shard_size is not None:
-            # Implement _shard_checkpoint or remove this logic if not needed
-            # shards, index = self._shard_checkpoint(state_dict, max_shard_size)
-            # for shard_file, shard in shards.items():
-            #     self._save_shard(shard, save_directory, shard_file, safe_serialization)
-            # if index is not None:
-            #     save_function(index, os.path.join(save_directory, 'pytorch_model.bin.index.json'))
-            pass
-        else:
-            # Use safe serialization if specified
-            if safe_serialization:
-                safe_save_file(state_dict, os.path.join(save_directory, 'model.safetensors'), metadata={"format": "pt"})
-            else:
-                save_function(state_dict, os.path.join(save_directory, 'pytorch_model.bin'))
-
-        # Save config
-        if hasattr(model_to_save, 'config') and hasattr(model_to_save.config, 'save_pretrained'):
+        if hasattr(model_to_save, 'config'):
             model_to_save.config.save_pretrained(save_directory)
-        else:
-            print("Warning: Model doesn't have a config with save_pretrained method. Config not saved.")
 
-        # Handle push to hub
-        if push_to_hub:
-            if hasattr(self, '_push_to_hub'):
-                return self._push_to_hub(save_directory, token=token, **kwargs)
-            else:
-                print("Warning: _push_to_hub method not implemented. Model not pushed to hub.")
+       # Save tokenizer if available
+        if hasattr(self, 'tokenizer'):
+            self.tokenizer.save_pretrained(save_directory)
+        
+        # Handle hub pushing with metadata
+        if push_to_hub and hasattr(self, '_push_to_hub'):
+            commit_message = kwargs.pop("commit_message", "Upload model")
+            private = kwargs.pop("private", False)
+            return self._push_to_hub(
+                save_directory,
+                commit_message=commit_message,
+                private=private,
+                **kwargs
+            )
 
         return save_directory
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        config = kwargs.get("config", None)
-        state_dict = kwargs.get("state_dict", None)
-
-        # If config is not provided, try to load it
-        if config is None:
-            config_file = os.path.join(pretrained_model_name_or_path, "config.json")
-            if os.path.exists(config_file):
-                config = cls.config_class.from_json_file(config_file)
-            else:
-                raise OSError(f"Config file not found in {pretrained_model_name_or_path}")
-
-        # Instantiate model
+        config = kwargs.get("config") or cls._load_config(pretrained_model_name_or_path)
         model = cls(config)
-
-        if state_dict is None:
-            # Look for various file types
-            file_types = ["*.bin", "*.pt", "*.pth", "*.ckpt", "*.safetensors"]
-            found_files = []
-            for file_type in file_types:
-                found_files.extend(glob.glob(os.path.join(pretrained_model_name_or_path, file_type)))
-            
-            if not found_files:
-                logger.warning(f"No model weights found in {pretrained_model_name_or_path}. "
-                               "Initializing model with random weights.")
-                return model
-            else:
-                # Use the first file found
-                state_dict = torch.load(found_files[0], map_location="cpu")
-
-        # Load the state dict if it exists
+       
+        state_dict = kwargs.get("state_dict") or cls._find_and_load_state_dict(
+            pretrained_model_name_or_path
+        )
         if state_dict:
             model.load_state_dict(state_dict, strict=False)
-
+           
         return model
+       
+    @staticmethod
+    def _load_config(path):
+        """Helper method for efficient config loading."""
+        config_file = os.path.join(path, "config.json")
+        if not os.path.exists(config_file):
+            raise OSError(f"Config file not found in {path}")
+        return PALMConfig.from_json_file(config_file)
+       
+    @staticmethod
+    def _find_and_load_state_dict(path):
+        """Helper method for efficient state dict loading."""
+        file_types = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt"]
+        for pattern in file_types:
+            files = glob.glob(os.path.join(path, pattern))
+            if files:
+                return torch.load(files[0], map_location="cpu")
+        return None
   
