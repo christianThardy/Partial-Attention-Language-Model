@@ -4,7 +4,7 @@ This ongoing implementation of **PALLM** is a wrapper on top of HuggingFace mode
 
 It decreases the effects of attention degeneration as seen in the hallucination problem via a bidirectional attention mask (mechanism to enhance source understanding), a separate positional encoding/specialized language embedding (mechanisms for source-target discrimination) to help the model differentiate between source (prompt) and target (generated output) text sequences. This version of PALLM is different from the original paper as it encourages the model to reconstruct and attend to the input via a source-autoencoder (SAE) objective (mechanism to enforce source grounding). 
 
-By encouraging the model to reconstruct and attend to the input, it stays tethered to the source content during generation. PALM allows:
+By encouraging the model to reconstruct and attend to the input, it stays tethered to the source content during generation. PALLM allows:
 
   - **Rich Contextual Representation:**
     - Bidirectional encoding of the prompt provides a more thorough understanding of the input.
