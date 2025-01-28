@@ -1,6 +1,13 @@
 import torch
+import torch.nn as nn
 
-def collate_fn_instrcut(batch):
+logger = logging.getLogger(__name__)
+
+
+def collate_fn_instruct(batch):
+    """
+    Use if you have instruction-oriented data.
+    """
     # Initialize dictionaries to store the batched data
     batched_data = {
         "input_ids": [],
@@ -16,10 +23,12 @@ def collate_fn_instrcut(batch):
     # Stack tensors, making sure all elements are tensors and have the same shape
     for key in batched_data:
         batched_data[key] = torch.stack(batched_data[key])
-
     return batched_data
 
 def collate_fn_base(batch):
+    """
+    Use if you have pretraining style data.
+    """
     # Identify all keys in the batch
     keys = batch[0].keys()  # e.g. ["input_ids","attention_mask","labels","source_len"]
     batched_data = {key: [item[key] for item in batch] for key in keys}
@@ -28,7 +37,6 @@ def collate_fn_base(batch):
     for key in batched_data:
         # Force them to integer (long) Tensors
         batched_data[key] = torch.tensor(batched_data[key], dtype=torch.long)
-
     return batched_data
 
 def init_custom_layer_weights(module):
@@ -49,19 +57,33 @@ def init_custom_layer_weights(module):
             init_custom_layer_weights(submodule)
 
 def is_custom_param(param_name):
-    # Here, treat partial_attention, lm_head, sae_head, or 'Fp' submodule as custom
+    """
+    Checks if a parameter name belongs to newly added custom modules
+    such as partial_attention blocks, Fp submodules, or lm/sae heads.
+    """
     if any(x in param_name for x in ["partial_attention", "lm_head", "sae_head", "Fp"]):
         return True
     return False
 
 def freeze_selected_layers(model_, freeze_embeddings=True, freeze_up_to_layer_idx=0):
+    """
+    Freezes or unfreezes embeddings and some portion of layers.
+    If freeze_up_to_layer_idx=12, for example, layers [0..11] are frozen,
+    and layers [12..end] are trainable.
+    """
     real_model = model_.module if hasattr(model_, 'module') else model_
+
+    # Freeze/unfreeze embeddings
     if freeze_embeddings:
         for param in real_model.embeddings.parameters():
             param.requires_grad = False
+            
+    # Freeze/unfreeze layers
     for idx, layer in enumerate(real_model.layers):
         for param in layer.parameters():
             param.requires_grad = (idx >= freeze_up_to_layer_idx)
+            
+     # Always keep LM and SAE heads trainable
     for param in real_model.lm_head.parameters():
         param.requires_grad = True
     for param in real_model.sae_head.parameters():
