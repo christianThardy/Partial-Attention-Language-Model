@@ -17,4 +17,4 @@ By encouraging the model to reconstruct and attend to the input, it stays tether
 
 ### Reference:
 
-Fu, Lam, Yu, Cho So, Hu, Liu,  Collier, *Decoder-Only or Encoder-Decoder? Interpreting Language Model as a Regularized Encoder-Decoder*. 2023. [<a href="https://arxiv.org/pdf/2304.04052" rel="nofollow">1</a></li>]
+Fu, Lam, Yu, Cho So, Hu, Liu,  Collier, *Decoder-Only or Encoder-Decoder? Interpreting Language Model as a Regularized Encoder-Decoder*. 2023.<sub>[<a href="https://arxiv.org/pdf/2304.04052" title="Fu" rel="nofollow">1</a>]</sub> 
