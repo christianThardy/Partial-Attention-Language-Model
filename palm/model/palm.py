@@ -125,7 +125,13 @@ class PALMModel(nn.Module):
         
         # Linear layers for language modeling, source autoencoding heads
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.sae_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # self.sae_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Redefine sae_head with Dropout
+        self.sae_head = nn.Sequential(
+            nn.Dropout(p=0.3),  # Adjust as needed
+            nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        )
         
         # Scale embeddings by sqrt(d_model)
         self.embed_scale = math.sqrt(config.hidden_size)
