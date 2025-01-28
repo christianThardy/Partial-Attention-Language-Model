@@ -1,8 +1,21 @@
+import torch
+import math
+import logging
+
 from rouge import Rouge
 from bert_score import score
 
+import evaluate
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
+
 
 def calculate_rouge(reference, hypothesis):
+    """
+    Calculates ROUGE-L F1 score between single 'reference' and 'hypothesis'.
+    Uses python-rouge's get_scores method.
+    """
     # Initialize ROUGE metric object
     rouge = Rouge()
 
@@ -12,15 +25,21 @@ def calculate_rouge(reference, hypothesis):
     # Return F1 score of the ROUGE-L metric (longest common subsequence)
     return scores['rouge-l']['f']
 
-
 def calculate_bert_score(reference, hypothesis):
+    """
+    Calculates BERTScore F1 between single 'reference' and 'hypothesis'.
+    Uses bert_score library's score() method. Returns float F1.
+    """
     # Calculate BERTScore F1 score between the hypothesis and reference texts
     _, _, f1 = score([hypothesis], [reference], lang="en")
     # Return F1 score as a scalar value
     return f1.item()
 
-
 def evaluate_generations(reference, palm_output, baseline_output):
+    """
+    Evaluates two model outputs (palm_output, baseline_output) against a reference,
+    returning their ROUGE-L and BERTScore metrics.
+    """
     # Calculate ROUGE-L and BERT scores for the PALM model output
     palm_rouge = calculate_rouge(reference, palm_output)
     baseline_rouge = calculate_rouge(reference, baseline_output)
@@ -36,8 +55,11 @@ def evaluate_generations(reference, palm_output, baseline_output):
         "baseline_bert_score": baseline_bert_score
     }
 
-
 def evaluate_information_extraction(true_info, palm_output, baseline_output):
+    """
+    Compares extracted answers from palm_output / baseline_output vs. true_info.
+    Returns a simple accuracy measure for each model.
+    """
     # Helper function to extract answers from the model output text
     def extract_answers(output):
         lines = output.split('\n')
@@ -57,3 +79,166 @@ def evaluate_information_extraction(true_info, palm_output, baseline_output):
         "palm_accuracy": palm_correct / len(true_info),
         "baseline_accuracy": baseline_correct / len(true_info)
     }
+
+def evaluate_model_perplexity(model, dataloader, device):
+    """
+    Computes the average cross-entropy loss across the given dataloader,
+    returning (avg_loss, perplexity). Minimizes overhead by disabling grad.
+    """
+    model.eval()
+    total_loss = 0.0
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            source_len = batch["source_len"].to(device, non_blocking=True)
+
+            # Forward pass (lm_logits, combined_loss, loss, sae_loss) = model(...)
+            outputs = model(
+                input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                source_len=source_len
+            )
+            # outputs[1] is combined_loss
+            total_loss += outputs[1].item()
+
+    avg_loss = total_loss / len(dataloader)
+    perplexity = math.exp(avg_loss)
+    return avg_loss, perplexity
+
+def compute_text_generation_metrics(predictions, references):
+    """
+    Computes multiple text generation metrics (e.g. BLEU, METEOR, ROUGE) in one pass
+    using Hugging Face evaluate method. Returns dict of scores.
+    """
+    metrics_dict = {}
+
+    # Example: Using evaluate.load for BLEU
+    try:
+        bleu_metric = evaluate.load("bleu")
+        preds_tok = [p.strip().split() for p in predictions]
+        refs_tok = [[r.strip().split()] for r in references]  # HF BLEU expects list-of-lists
+        bleu_score = bleu_metric.compute(predictions=preds_tok, references=refs_tok)["bleu"]
+        metrics_dict["BLEU"] = bleu_score
+    except:
+        pass  # skip if 'bleu' not installed or other error
+
+    # METEOR
+    try:
+        meteor_metric = evaluate.load("meteor")
+        meteor_score = meteor_metric.compute(predictions=predictions, references=references)["meteor"]
+        metrics_dict["METEOR"] = meteor_score
+    except:
+        pass
+
+    # ROUGE
+    try:
+        rouge_metric = evaluate.load("rouge")
+        rouge_score = rouge_metric.compute(predictions=predictions, references=references)
+        # use rougeL F1 as an example
+        metrics_dict["ROUGEL"] = rouge_score["rougeL"].mid.fmeasure
+    except:
+        pass
+
+    return metrics_dict
+
+def evaluate_generation_on_dataset(
+    model,
+    tokenizer,
+    dataset,
+    device,
+    max_gen_length=128,
+    temperature=1.0,
+    top_p=0.9
+):
+    """
+    Generates model outputs for each sample's prompt (or source) in 'dataset'
+    and compares them to references. Returns aggregated HF metrics (BLEU, METEOR, ROUGE).
+    Adjust logic for how 'prompt'/'completion' columns are used as needed.
+    """
+    model.eval()
+    predictions, references = [], []
+
+    for item in tqdm(dataset, desc="Generating for evaluation"):
+        prompt = item.get("prompt", "")
+        reference = item.get("completion", "")
+        references.append(reference)
+
+        # Encode prompt
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        # Generate
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                # For advanced usage, pass in custom generation args
+                output_ids = model.generate(
+                    input_ids,
+                    max_length=max_gen_length,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=top_p,
+                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+
+        pred_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        predictions.append(pred_text)
+
+    return compute_text_generation_metrics(predictions, references)
+
+def compute_stepwise_hallucination_ratio(
+    model,
+    tokenizer,
+    dataset,
+    device,
+    max_gen_length=64,
+    alpha=1.0,
+    beta=1.0
+):
+    """
+    Example placeholder to measure how "aligned" tokens are with the source or 
+    reference. Your snippet can remain minimal or be extended if you use it. We 
+    preserve it here for completeness.
+    """
+    model.eval()
+    # Just a stub from your advanced example:
+    # Real implementation would generate tokens, check alignment, etc.
+    # Return an empty list if not in usage
+    return []
+
+def numerical_sensitivity_analysis(
+    model,
+    tokenizer,
+    source_text,
+    device,
+    perturb_scale=1e-3,
+    max_tokens=50
+):
+    """
+    Another placeholder for analyzing hidden-state sensitivity to small input 
+    perturbations.
+    """
+    model.eval()
+    # Stub from your advanced example
+    return []
+
+def evaluate_multiple_models(
+    model_names,
+    dataset,
+    device,
+    max_gen_length=128,
+    temperature=1.0,
+    top_p=0.9
+):
+    """
+    Example function for comparing multiple checkpoint names or model paths on a single 
+    dataset.
+    """
+    final_results = {}
+    # Implementation would loop over model_names, load, generate, compute metrics, etc.
+    # Omitted for brevity or left minimal:
+    for mname in model_names:
+        final_results[mname] = {}
+    return final_results
