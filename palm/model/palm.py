@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file as safe_save_file
 
+from transformers.modeling_utils import shard_checkpoint
+
 from attention import PALMAttention, PALMPartialAttention
 from embeddings import PALMEmbeddings
 
@@ -168,8 +170,10 @@ class PALMModel(nn.Module):
         # Apply causal attention to the target sequence
         if source_length < seq_length:
             target_length = seq_length - source_len
+            
             causal_mask = torch.tril(torch.ones((target_length, target_length), device=input_ids.device))
             mask[:, :, source_length:, source_length:] = causal_mask
+            
             # Allow target sequence to attend to all of source sequence
             mask[:, :, source_length:, :source_length] = 1
     
@@ -282,6 +286,7 @@ class PALMModel(nn.Module):
             # Build a boolean mask for each sample's source portion
             B, T, _ = sae_logits.shape   # e.g. [8, 1024, vocab_size]
             range_tensor = torch.arange(T, device=labels.device).unsqueeze(0)  # shape [1, T]
+            
             # shape [B, T], True if j < source_len[i], else False
             mask = range_tensor < source_len.unsqueeze(1)
 
@@ -399,6 +404,7 @@ class PALMModel(nn.Module):
     
     def adjust_logits_during_generation(self, logits, cur_len, max_length, min_length, repetition_penalty, input_ids):
         """Adjust token logits during generation. Optimized adjustment with vectorized operations."""
+        
         # Apply repetition penalty
         if repetition_penalty != 1.0:
             # Vectorized repetition penalty application
@@ -422,6 +428,7 @@ class PALMModel(nn.Module):
         """Filter a distribution of logits using top-k and/or top-p (nucleus) filtering."""
         if top_k > 0:
             top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
+            
             # Remove all tokens with a probability less than the last token of the top-k
             topk_values, _ = torch.topk(logits, top_k)
             indices_to_remove = logits < topk_values[..., -1, None]
@@ -433,6 +440,7 @@ class PALMModel(nn.Module):
 
             # Remove tokens with cumulative probability above the threshold (token with 0 are kept)
             sorted_indices_to_remove = cumulative_probs > top_p
+            
             # Shift indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
@@ -447,6 +455,7 @@ class PALMModel(nn.Module):
     def save_pretrained(
         self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, push_to_hub=False, 
         max_shard_size="5GB", safe_serialization=True, variant=None, token=None, save_peft_format=True, **kwargs):
+            
         """Save a model and its configuration file to a directory, so that it can be re-loaded using the 
         `from_pretrained` class method."""
         if not is_main_process:
@@ -481,7 +490,6 @@ class PALMModel(nn.Module):
             )
         else:
             if max_shard_size and max_shard_size != "5GB":
-                from transformers.modeling_utils import shard_checkpoint
                 sharded_state_dict = shard_checkpoint(state_dict, max_shard_size=max_shard_size)
                 for shard_file, shard in sharded_state_dict.items():
                     save_function(shard, os.path.join(save_directory, shard_file))
