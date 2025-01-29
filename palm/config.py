@@ -9,7 +9,7 @@ class PALMConfig(PretrainedConfig):
 
     def __init__(
         self,
-        base_model_name="meta-llama/Llama-3.2-3B", # Default base model
+        base_model_name="meta-llama/Llama-3.2-3B", # Default base model, adjust as needed
         vocab_size=128256, # Vocabulary size, defining number of tokens available
         hidden_size=3072, # Size of hidden layers in the model
         num_hidden_layers=28, # Number of hidden layers in the model
@@ -77,7 +77,7 @@ class PALMConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.transformers_version = transformers_version
         self.architectures = architectures
-        self.layer_norm_eps = layer_norm_eps  # Ensure this is set
+        self.layer_norm_eps = layer_norm_eps
         self.sae_weight = sae_weight
         self.gradient_checkpointing = gradient_checkpointing
 
