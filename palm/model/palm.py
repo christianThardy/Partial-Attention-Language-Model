@@ -349,7 +349,6 @@ class PALMModel(nn.Module):
             current_length = generated_sequence.size(1)
             cumulative_attention_mask[:, :, current_length-1, :current_length] = True
 
-
             model_inputs = {
                 "input_ids": generated_sequence,
                 "attention_mask": cumulative_attention_mask[:, :, :current_length, :current_length]
