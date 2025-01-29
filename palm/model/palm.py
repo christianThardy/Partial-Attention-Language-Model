@@ -129,7 +129,7 @@ class PALMModel(nn.Module):
 
         # Redefine sae_head with Dropout
         self.sae_head = nn.Sequential(
-            nn.Dropout(p=0.3),  # Adjust as needed
+            nn.Dropout(p=0.2),  # Adjust as needed
             nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         )
         
