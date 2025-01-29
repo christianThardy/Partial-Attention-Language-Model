@@ -6,6 +6,7 @@ import gc
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.nn.utils import clip_grad_norm_
 from torch.cuda.amp import autocast, GradScaler
 # from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -13,7 +14,10 @@ from palm.constants import *
 from palm.training.utils import freeze_selected_layers, is_custom_param
 
 # Transformers Schedulers
-from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup
+from transformers import (
+    get_linear_schedule_with_warmup, 
+    get_cosine_schedule_with_warmup, 
+    get_polynomial_decay_schedule_with_warmup)
 
 from tqdm import tqdm
 import wandb
@@ -34,6 +38,12 @@ class PALMTrainer:
         self.config = config
         self.tokenizer = tokenizer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Determine whether to use GPU or CPU
+
+        # Handle DataParallel
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Using {torch.cuda.device_count()} GPUs!")
+            self.model = nn.DataParallel(self.model)
+
         self.model.to(self.device) # Move model to the selected device
 
         # Prepare param groups for different LR
@@ -47,31 +57,31 @@ class PALMTrainer:
                     self.pretrained_params.append(param)
         
         # Initialize optimizer with AdamW, including differential learning rates and weight decay
-        optimizer = torch.optim.AdamW([
-            {"params": pretrained_params, "lr": PRETRAINED_LR, "weight_decay": 0.01},
-            {"params": custom_params, "lr": CUSTOM_LR, "weight_decay": 0.09},
+        self.optimizer = AdamW([
+            {"params": self.pretrained_params, "lr": constants.PRETRAINED_LR, constants.PRETRAINED_WEIGHT_DECAY},
+            {"params": self.custom_params, "lr": constants.CUSTOM_LR, constants.CUSTOM_WEIGHT_DECAY, constants.CUSTOM_BETAS, constants.CUSTOM_EPSILON},
         ])
         # Build LR scheduler
-        total_steps = len(self.train_dataloader) * NUM_TRAIN_EPOCHS // GRADIENT_ACCUMULATION_STEPS
+        total_steps = len(self.train_dataloader) * constants.NUM_TRAIN_EPOCHS // constants.GRADIENT_ACCUMULATION_STEPS
 
-        if USE_COSINE_DECAY:
+        if constants.USE_COSINE_DECAY:
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=WARMUP_STEPS,
+                num_warmup_steps=constants.WARMUP_STEPS,
                 num_training_steps=total_steps
             )
-        elif USE_POLYNOMIAL_DECAY:
+        elif constants.USE_POLYNOMIAL_DECAY:
             self.scheduler = get_polynomial_decay_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=WARMUP_STEPS,
+                num_warmup_steps=constants.WARMUP_STEPS,
                 num_training_steps=total_steps,
-                lr_end=POLY_LR_END,
+                lr_end=constants.POLY_LR_END,
                 power=1.0
             )
         else:
             self.scheduler = get_linear_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=WARMUP_STEPS,
+                num_warmup_steps=constants.WARMUP_STEPS,
                 num_training_steps=total_steps
             )
         # AMP GradScaler (only needed if any parameters are fp32)
@@ -82,13 +92,35 @@ class PALMTrainer:
         self.global_step = 0
         self.best_eval_loss = float("inf")
         self.no_improvement_steps = 0
-        self.patience = EARLY_STOP_PATIENCE
+        self.patience = constants.EARLY_STOP_PATIENCE
         self.start_time = time.time()
 
-        # Possibly freeze layers at start
-        # If using a chunk-based schedule, that will happen inside train() at the start of each epoch
-        freeze_selected_layers(self.model, freeze_embeddings=FREEZE_SCHEDULE_INIT["freeze_embeddings"],
-                               freeze_up_to_layer_idx=FREEZE_SCHEDULE_INIT["freeze_up_to_layer_idx"])
+        # Determine the real model for configurations
+        real_model = self.model.module if hasattr(self.model, 'module') else self.model
+        NUM_LAYERS = real_model.config.num_hidden_layers
+
+        # Define Freeze Schedule
+        self.FREEZE_SCHEDULE = [
+            # Epoch 0: Only custom components and topmost layers are trainable.
+            {"epoch": 0, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 3}, 
+            {"epoch": 1, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 6},
+            # Epoch 2: Unfreeze the top 9 layers etc.
+            {"epoch": 2, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 9},
+            {"epoch": 3, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 12},
+            {"epoch": 4, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 15},
+            # Epoch 5: Unfreeze top 18 layers etc.
+            {"epoch": 5, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 18},
+            {"epoch": 6, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 21},
+            # Epoch 7: Fully unfreeze all layers (including embeddings).
+            {"epoch": 7, "freeze_embeddings": False, "freeze_up_to_layer_idx": 0},
+        ]
+
+        initial_schedule = self.FREEZE_SCHEDULE[0]
+        freeze_selected_layers(
+            self.model, 
+            freeze_embeddings=initial_schedule["freeze_embeddings"],
+            freeze_up_to_layer_idx=initial_schedule["freeze_up_to_layer_idx"]
+        )
         logger.info("Trainer initialized.")
         
     # Define training process
@@ -97,37 +129,15 @@ class PALMTrainer:
         Full training loop. Contains selective freezing schedule,
         dynamic SAE weighting (optional), and evaluation + early stopping.
         """
+        real_model = self.model.module if hasattr(self.model, 'module') else self.model
         NUM_LAYERS = real_model.config.num_hidden_layers
-        FREEZE_SCHEDULE = [
-            # Epoch 0: Only custom components and topmost layers are trainable.
-            {"epoch": 0, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 3}, 
-            {"epoch": 1, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 6},
-            # Epoch 2: Unfreeze the top 9 layers
-            {"epoch": 2, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 9},
-            {"epoch": 3, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 12},
-            {"epoch": 4, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 15},
-            # Epoch 5: Unfreeze top 18 layers
-            {"epoch": 5, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 18},
-            {"epoch": 6, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 21},
-            # Epoch 7: Fully unfreeze all layers (including embeddings).
-            {"epoch": 7, "freeze_embeddings": False, "freeze_up_to_layer_idx": 0},
-        ]
         
-        # Initialize with the first schedule stage
-        initial_schedule = FREEZE_SCHEDULE[0]
-        freeze_selected_layers(model, freeze_embeddings=initial_schedule["freeze_embeddings"],
-                               freeze_up_to_layer_idx=initial_schedule["freeze_up_to_layer_idx"])
-        # Early stopping variables
-        best_eval_loss = float("inf")
-        no_improvement_steps = 0
-        patience = 3
-        
-        for epoch in range(NUM_TRAIN_EPOCHS):
+        for epoch in range(constants.NUM_TRAIN_EPOCHS):
             # Check if we should switch freeze settings at this epoch
-            for schedule_stage in FREEZE_SCHEDULE:
+            for schedule_stage in self.FREEZE_SCHEDULE:
                 if epoch == schedule_stage["epoch"]:
                     freeze_selected_layers(
-                        model,
+                        self.model,
                         freeze_embeddings=schedule_stage["freeze_embeddings"],
                         freeze_up_to_layer_idx=schedule_stage["freeze_up_to_layer_idx"]
                     )
@@ -136,23 +146,23 @@ class PALMTrainer:
                                 f"Layers up to idx {schedule_stage['freeze_up_to_layer_idx']} are frozen.")
 
             # Possibly adjust dynamic SAE weight
-            if USE_DYNAMIC_SAE_WEIGHT:
-                fraction_done = epoch / float(NUM_TRAIN_EPOCHS - 1 if NUM_TRAIN_EPOCHS > 1 else 1)
-                new_weight = SAE_START_WEIGHT + (SAE_END_WEIGHT - SAE_START_WEIGHT) * fraction_done
-                # Update inside model config
-                real_model = self.model.module if hasattr(self.model, 'module') else self.model
-                real_model.config.sae_weight = new_weight
-                logger.info(f"Dynamic SAE weight updated to {new_weight:.4f} at epoch {epoch}")
+            if constants.USE_DYNAMIC_SAE_WEIGHT:
+                if constants.SAE_START_WEIGHT != constants.SAE_END_WEIGHT:
+                    fraction_done = epoch / float(constants.NUM_TRAIN_EPOCHS - 1 if constants.NUM_TRAIN_EPOCHS > 1 else 1.0)
+                    new_weight = constants.SAE_START_WEIGHT + (constants.SAE_END_WEIGHT - constants.SAE_START_WEIGHT) * fraction_done
+                    # Update inside model config
+                    real_model.config.sae_weight = new_weight
+                    logger.info(f"Dynamic SAE weight updated to {new_weight:.4f} at epoch {epoch}")
 
             # One epoch of training
-            self.train_epochs(epoch)
+            avg_train_loss = self.train_epochs(epoch)
 
             # Evaluate
             eval_loss = self.evaluate()
             avg_eval_loss = eval_loss / len(self.eval_dataloader)
-            perplexity = torch.exp(torch.tensor(avg_eval_loss, device=self.device))
+            perplexity = math.exp(avg_eval_loss)
 
-            # Check improvements
+            # Check improvements for early stopping
             if avg_eval_loss < self.best_eval_loss:
                 self.best_eval_loss = avg_eval_loss
                 self.no_improvement_steps = 0
@@ -165,24 +175,14 @@ class PALMTrainer:
             # Log evaluation results
             wandb.log({
                 "eval_loss": avg_eval_loss,
-                "perplexity": perplexity.item(),
+                "perplexity": perplexity,
                 "global_step": self.global_step
             })
             logger.info(f"[Epoch {epoch}/{NUM_TRAIN_EPOCHS}] eval_loss={avg_eval_loss:.4f}, ppl={perplexity.item():.4f}")
 
-            # Early Stopping check
-            if avg_eval_loss < best_eval_loss:
-                best_eval_loss = avg_eval_loss
-                no_improvement_steps = 0
-            else:
-                no_improvement_steps += 1
-                if no_improvement_steps >= patience:
-                    logger.info("Early stopping triggered.")
-                    break
-
             # Optionally save checkpoint
-            if (epoch + 1) % CHECKPOINT_EVERY_EPOCH == 0:
-                ckpt_dir = f"{CHECKPOINT_DIR}/epoch_{epoch+1}"
+            if (epoch + 1) % constants.CHECKPOINT_EVERY_EPOCH == 0:
+                ckpt_dir = os.path.join(constants.CHECKPOINT_DIR, f"epoch_{epoch+1}")
                 self.save_checkpoint(ckpt_dir)
 
         logger.info("Training completed.")
@@ -214,15 +214,15 @@ class PALMTrainer:
                 )
             # Accumulate loss
             if combined_loss is not None:
-                combined_loss = combined_loss / GRADIENT_ACCUMULATION_STEPS
+                combined_loss = combined_loss / constants.GRADIENT_ACCUMULATION_STEPS
                 self.scaler.scale(combined_loss).backward()
                 total_loss += (loss.item() if loss is not None else 0.0)
                 total_sae_loss += (sae_loss.item() if sae_loss is not None else 0.0)
 
             # Update
-            if (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0 or step == total_steps_in_epoch - 1:
+            if (step + 1) % constants.GRADIENT_ACCUMULATION_STEPS == 0 or step == total_steps_in_epoch - 1:
                 self.scaler.unscale_(self.optimizer)
-                clip_grad_norm_(self.model.parameters(), MAX_GRAD_NORM)
+                clip_grad_norm_(self.model.parameters(), constants.MAX_GRAD_NORM)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
@@ -230,14 +230,14 @@ class PALMTrainer:
                 self.global_step += 1
 
                 # Logging
-                if self.global_step % LOG_EVERY_STEPS == 0:
-                    samples_per_second = TRAIN_BATCH_SIZE / (time.time() - self.start_time)
+                if self.global_step % constants.LOG_EVERY_STEPS == 0:
+                    samples_per_second = constants.TRAIN_BATCH_SIZE / (time.time() - self.start_time)
                     self.start_time = time.time()
 
                     wandb.log({
-                        "train_loss": loss.item() if loss else 0.0,
-                        "sae_loss": sae_loss.item() if sae_loss else 0.0,
-                        "combined_loss": combined_loss.item() if combined_loss else 0.0,
+                        "train_loss": (loss.item() if loss else 0.0),
+                        "sae_loss": (sae_loss.item() if sae_loss else 0.0),
+                        "combined_loss": (combined_loss.item() if combined_loss else 0.0),
                         "learning_rate": self.scheduler.get_last_lr()[0],
                         "global_step": self.global_step,
                         "epoch": epoch,
