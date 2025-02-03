@@ -64,7 +64,8 @@ class PALMAttention(nn.Module):
             
             # Project Q, K, V
             query_layer = self.transpose_for_scores(self.query(hidden_states)) # Compute query matrix
-            
+
+            # Apply caching
             if use_cache and past is not None:
                 past_key, past_value = past
                 new_key = self.transpose_for_scores(self.key(normed_hidden_states))
@@ -146,6 +147,7 @@ class PALMAttention(nn.Module):
                 )
                 logger.warning("Non-finite values detected in attention output, zeroing them")
 
+            # KV caching parameter to return both the output and the new cached states
             if use_cache:
                 new_past = (key_layer, value_layer)
                 return attention_output, new_past
