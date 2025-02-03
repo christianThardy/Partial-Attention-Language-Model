@@ -55,7 +55,7 @@ class PALMAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3) # Permute dimensions to (batch, heads, seq_len, head_size)
 
-    def forward(self, hidden_states, attention_mask=None):
+    def forward(self, hidden_states, attention_mask=None, use_cache=False, past=None):
         try:
             logger.debug(f"Hidden states shape: {hidden_states.shape}") # Log shape of hidden states
             
@@ -64,8 +64,16 @@ class PALMAttention(nn.Module):
             
             # Project Q, K, V
             query_layer = self.transpose_for_scores(self.query(hidden_states)) # Compute query matrix
-            key_layer = self.transpose_for_scores(self.key(hidden_states)) # Compute key matrix
-            value_layer = self.transpose_for_scores(self.value(hidden_states)) # Compute value matrix
+            
+            if use_cache and past is not None:
+                past_key, past_value = past
+                new_key = self.transpose_for_scores(self.key(normed_hidden_states))
+                new_value = self.transpose_for_scores(self.value(normed_hidden_states))
+                key_layer = torch.cat([past_key, new_key], dim=2)
+                value_layer = torch.cat([past_value, new_value], dim=2)
+            else:
+                key_layer = self.transpose_for_scores(self.key(hidden_states)) # Compute key matrix
+                value_layer = self.transpose_for_scores(self.value(hidden_states)) # Compute value matrix
     
             logger.debug(f"Query layer shape: {query_layer.shape}")
             logger.debug(f"Key layer shape: {key_layer.shape}")
@@ -137,6 +145,10 @@ class PALMAttention(nn.Module):
                     torch.zeros_like(attention_output)
                 )
                 logger.warning("Non-finite values detected in attention output, zeroing them")
+
+            if use_cache:
+                new_past = (key_layer, value_layer)
+                return attention_output, new_past
     
             return attention_output
     
@@ -198,11 +210,19 @@ class PALMPartialAttention(nn.Module):
         source_mask_3d = source_mask.unsqueeze(-1).to(P.dtype) # (B, T, 1)
         P = P * source_mask_3d  # beyond source_len => zeroed
 
-        # Create K,V from masked P, but Q is from the entire hidden_states
-        query_layer = self.transpose_for_scores(self.query(hidden_states)) # Compute query matrix
-        key_layer = self.transpose_for_scores(self.key(P)) # Compute key matrix from the transformed source states
-        value_layer = self.transpose_for_scores(self.value(P)) # Compute value matrix from the transformed source states
+        if use_cache and past is not None:
+            past_key, past_value = past
+            new_key = self.transpose_for_scores(self.key(P))
+            new_value = self.transpose_for_scores(self.value(P))
+            key_layer = torch.cat([past_key, new_key], dim=2)
+            value_layer = torch.cat([past_value, new_value], dim=2)
+        else:
+            # Create K,V from masked P, but Q is from the entire hidden_states
+            key_layer = self.transpose_for_scores(self.key(P)) # Compute key matrix from the transformed source states
+            value_layer = self.transpose_for_scores(self.value(P)) # Compute value matrix from the transformed source states
 
+        query_layer = self.transpose_for_scores(self.query(hidden_states)) # Compute query matrix
+        
         # Compute attention scores: shape (B, nHeads, T, T)
         d_k = self.attention_head_size
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) / math.sqrt(d_k)
@@ -255,7 +275,11 @@ class PALMPartialAttention(nn.Module):
                 torch.zeros_like(attention_output)
             )
             logger.warning("Non-finite values detected in partial attention output, zeroing them")
-        
+
+        if use_cache:
+            new_past = (key_layer, value_layer)
+            return attention_output, new_past
+            
         # Return the final attention output
         return attention_output
     
