@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file as safe_save_file
+from safetensors.torch import load_file as safe_load_file
 
 from transformers.modeling_utils import shard_checkpoint
 
@@ -82,20 +83,41 @@ class PALMLayer(nn.Module):
         self.output = PALMOutput(config)
 
     def forward(self, hidden_states, attention_mask=None):
-        # Standard self-attention (the "ATTl" block in the paper)
-        attention_output = self.attention(
-            hidden_states, 
-            attention_mask=attention_mask
-        )
+        # Expect past to be a tuple/list with two elements: past for self.attention and past for partial_attention.
+        past_attn = past[0] if (past is not None) else None
+        past_partial = past[1] if (past is not None) else None
 
-        # Apply partial attention using a subset of the hidden states 
+        # 1) Standard self-attention (the "ATTl" block in the paper)
+        if use_cache:
+            attention_output, new_past_attn = self.attention(
+                hidden_states,
+                attention_mask=attention_mask,
+                use_cache=True,
+                past=past_attn
+            )
+        else:
+            attention_output = self.attention(hidden_states, attention_mask=attention_mask)
+            new_past_attn = None
+
+        # Apply caching and partial attention using a subset of the hidden states 
         # (focusing only on the source portion)
-        partial_attention_output = self.partial_attention(
-            hidden_states=attention_output,
-            source_states=attention_output,
-            source_len=source_len,
-            attention_mask=attention_mask
-        )
+        if use_cache:
+            partial_attention_output, new_past_partial = self.partial_attention(
+                hidden_states=attention_output,
+                source_states=attention_output,
+                source_len=source_len,
+                attention_mask=attention_mask,
+                use_cache=True,
+                past=past_partial
+            )
+        else:
+            partial_attention_output = self.partial_attention(
+                hidden_states=attention_output,
+                source_states=attention_output,
+                source_len=source_len,
+                attention_mask=attention_mask
+            )
+            new_past_partial = None
         
         # Process output of the intermediate layer with the partial attention
         intermediate_output = self.intermediate(partial_attention_output)
@@ -109,6 +131,10 @@ class PALMLayer(nn.Module):
                 torch.zeros_like(layer_output)
             )
             logger.warning("Non-finite values detected in final PALMLayer output, zeroing them")
+
+        # KV caching parameter to return both the output and the new cached states
+        if use_cache:
+            return layer_output, (new_past_attn, new_past_partial)
             
         return layer_output
     
@@ -215,7 +241,8 @@ class PALMModel(nn.Module):
 
             # Use entire hidden_states for sae_head, not slicing
             lm_logits = self.lm_head(hidden_states)
-            sae_logits = self.sae_head(hidden_states)  # shape [B, T, vocab_size]
+            sae_logits = self.sae_head(self.pre_sae_dropout(hidden_states))  # shape [B, T, vocab_size], add dropout before
+            sae_logits = self.post_sae_dropout(sae_logits)  # Add dropout after
 
             # Compute losses with per‐sample mask
             loss, sae_loss, combined_loss = self._compute_loss(
@@ -229,6 +256,32 @@ class PALMModel(nn.Module):
                   f"attention_mask: {attention_mask.shape if isinstance(attention_mask, torch.Tensor) else 'not a tensor'}, "
                   f"labels: {labels.shape if isinstance(labels, torch.Tensor) else 'not a tensor'},")
             raise
+
+    # Helper function for cached forward pass
+    def _forward_with_cache(self, input_ids, attention_mask, past_key_values):
+        """
+        Incrementally processes input_ids (expected shape: [B, 1]) using cached key/value states.
+        Returns the lm_logits and an updated list of past_key_values (one per layer).
+        """
+        # Process only the new token through embeddings.
+        hidden_states = self.embeddings(input_ids, source_len=input_ids.shape[1])
+        hidden_states = hidden_states * self.embed_scale
+        
+        new_past = []
+        # Loop over layers; each layer now supports use_cache and a past argument.
+        for i, layer in enumerate(self.layers):
+            past = past_key_values[i] if past_key_values is not None else None
+            # Pass use_cache=True and the per-layer past (if any)
+            hidden_states, new_past_i = layer(
+                hidden_states,
+                attention_mask=attention_mask,  # may be None during incremental steps
+                source_len=None,                # not needed during incremental generation
+                use_cache=True,
+                past=past
+            )
+            new_past.append(new_past_i)
+        lm_logits = self.lm_head(hidden_states)
+        return lm_logits, new_past
 
     def _validate_input(self, input_ids):
         if not isinstance(input_ids, torch.Tensor):
@@ -317,12 +370,16 @@ class PALMModel(nn.Module):
 
         return loss, sae_loss, combined_loss
 
+    # Optional caching
     def generate(
         self, input_ids, max_length=None, min_length=None, do_sample=True, temperature=1.0, 
         top_k=50, top_p=1.0, repetition_penalty=1.0, pad_token_id=None, eos_token_id=None, 
-        attention_mask=None, **kwargs
+        attention_mask=None, use_cache=False, **kwargs
     ):
-        """Generate method with improved memory efficiency and vectorized operations."""
+        """Generates sequences token by token with improved memory efficiency and vectorized operations.
+           Optional argument:
+          - use_cache (bool): if True, caches past key/value states to avoid reprocessing the entire sequence.
+        """
         # Set default values for generation parameters
         max_length = max_length if max_length is not None else self.config.max_length
         min_length = min_length if min_length is not None else self.config.min_length
@@ -334,72 +391,152 @@ class PALMModel(nn.Module):
         input_ids = input_ids.to(dev, non_blocking=True)
 
         batch_size, seq_len = input_ids.shape
-        cumulative_attention_mask = torch.zeros(
-            (batch_size, 1, max_length, max_length),
-            device=dev,
-            dtype=torch.bool
-        )
-        cumulative_attention_mask[:, :, :seq_len, :seq_len] = True
+        if not use_cache:
+            cumulative_attention_mask = torch.zeros(
+                (batch_size, 1, max_length, max_length),
+                device=dev,
+                dtype=torch.bool
+            )
+            cumulative_attention_mask[:, :, :seq_len, :seq_len] = True
         
-        # Initialize sequence tracking and keep track of which sequences are already finished
-        unfinished_sequences = torch.ones(batch_size, device=dev, dtype=torch.long)
-        
-        # Initialize generated sequence with the input sequence
-        generated_sequence = input_ids
-        
-        next_tokens = torch.zeros(batch_size, device=dev, dtype=torch.long)
+            # Initialize sequence tracking and keep track of which sequences are already finished
+            unfinished_sequences = torch.ones(batch_size, device=dev, dtype=torch.long)
+            
+            # Initialize generated sequence with the input sequence
+            generated_sequence = input_ids
+            
+            next_tokens = torch.zeros(batch_size, device=dev, dtype=torch.long)
+    
+            for _ in range(max_length - seq_len):
+                current_length = generated_sequence.size(1)
+                cumulative_attention_mask[:, :, current_length-1, :current_length] = True
+    
+                model_inputs = {
+                    "input_ids": generated_sequence,
+                    "attention_mask": cumulative_attention_mask[:, :, :current_length, :current_length]
+                }
+    
+                # Specify device_type for autocast
+                generation_device_type = dev.type
+                with torch.no_grad(), torch.amp.autocast(device_type=generation_device_type,
+                                                         enabled=(generation_device_type == "cuda")):
+                    outputs = self(**model_inputs)
+                    next_token_logits = outputs[0][:, -1, :]
+    
+                    next_token_logits = self.adjust_logits_during_generation(
+                        next_token_logits,
+                        current_length,
+                        max_length,
+                        min_length,
+                        repetition_penalty,
+                        generated_sequence
+                    )
+                    next_token_logits.div_(temperature)
+                    next_token_logits = self.top_k_top_p_filtering(
+                        next_token_logits,
+                        top_k=top_k,
+                        top_p=top_p
+                    )
+                    if do_sample:
+                        probs = F.softmax(next_token_logits, dim=-1)
+                        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                    else:
+                        next_tokens = next_token_logits.argmax(dim=-1)
+    
+                next_tokens = torch.where(
+                    unfinished_sequences.bool(),
+                    next_tokens,
+                    pad_token_id * torch.ones_like(next_tokens)
+                )
+                unfinished_sequences.mul_((next_tokens != eos_token_id).long())
+    
+                generated_sequence = torch.cat([
+                    generated_sequence,
+                    next_tokens.unsqueeze(-1)
+                ], dim=-1)
+    
+                if unfinished_sequences.max() == 0:
+                    break
+            return generated_sequence
 
-        for _ in range(max_length - seq_len):
-            current_length = generated_sequence.size(1)
-            cumulative_attention_mask[:, :, current_length-1, :current_length] = True
+        else:
+            # Generation loop with caching (use_cache=True)
+            past_key_values = [None] * len(self.layers)  # Initialize cache per layer
+            generated_sequence = input_ids
+            unfinished_sequences = torch.ones(batch_size, device=dev, dtype=torch.long)
+            
+            # Prime the cache by processing the full initial input sequence
+            with torch.no_grad(), torch.amp.autocast(device_type=dev.type,
+                                                      enabled=(dev.type == "cuda")):
+                                                          
+                # Call the regular forward pass so that caches are set up
+                outputs = self(
+                    generated_sequence,
+                    attention_mask=attention_mask,
+                    labels=None,
+                    source_len=torch.full((batch_size,), seq_len, dtype=torch.long, device=dev)
+                )
+                # For caching, assume the final token’s outputs come from _forward_with_cache
+                # Initialize past_key_values by processing the last token
+                last_token = generated_sequence[:, -1:].clone()
+                lm_logits, past_key_values = self._forward_with_cache(
+                    last_token,
+                    attention_mask=None,  # During incremental steps, attention mask is handled internally
+                    past_key_values=past_key_values
+                )
+                next_token_logits = lm_logits[:, -1, :]
 
-            model_inputs = {
-                "input_ids": generated_sequence,
-                "attention_mask": cumulative_attention_mask[:, :, :current_length, :current_length]
-            }
-
-            # Specify device_type for autocast
-            generation_device_type = dev.type
-            with torch.no_grad(), torch.amp.autocast(device_type=generation_device_type,
-                                                     enabled=(generation_device_type == "cuda")):
-                outputs = self(**model_inputs)
-                next_token_logits = outputs[0][:, -1, :]
-
+            for _ in range(max_length - seq_len):
+                # Adjust logits and sample next token.
                 next_token_logits = self.adjust_logits_during_generation(
                     next_token_logits,
-                    current_length,
+                    generated_sequence.size(1),
                     max_length,
                     min_length,
                     repetition_penalty,
                     generated_sequence
                 )
+                
                 next_token_logits.div_(temperature)
                 next_token_logits = self.top_k_top_p_filtering(
                     next_token_logits,
                     top_k=top_k,
                     top_p=top_p
                 )
+                
                 if do_sample:
                     probs = F.softmax(next_token_logits, dim=-1)
                     next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
                 else:
                     next_tokens = next_token_logits.argmax(dim=-1)
 
-            next_tokens = torch.where(
-                unfinished_sequences.bool(),
-                next_tokens,
-                pad_token_id * torch.ones_like(next_tokens)
-            )
-            unfinished_sequences.mul_((next_tokens != eos_token_id).long())
-
-            generated_sequence = torch.cat([
-                generated_sequence,
-                next_tokens.unsqueeze(-1)
-            ], dim=-1)
-
-            if unfinished_sequences.max() == 0:
-                break
-        return generated_sequence
+                next_tokens = torch.where(
+                    unfinished_sequences.bool(),
+                    next_tokens,
+                    pad_token_id * torch.ones_like(next_tokens)
+                )
+                unfinished_sequences.mul_((next_tokens != eos_token_id).long())
+                
+                # Append new token to generated_sequence
+                generated_sequence = torch.cat([
+                    generated_sequence,
+                    next_tokens.unsqueeze(-1)
+                ], dim=-1)
+                
+                # Process only the new token using the cache
+                with torch.no_grad(), torch.amp.autocast(device_type=dev.type,
+                                                          enabled=(dev.type == "cuda")):
+                    new_input = next_tokens.unsqueeze(-1)  # shape [B, 1]
+                    lm_logits, past_key_values = self._forward_with_cache(
+                        new_input,
+                        attention_mask=None,
+                        past_key_values=past_key_values
+                    )
+                    next_token_logits = lm_logits[:, -1, :]
+                                                              
+                if unfinished_sequences.max() == 0:
+                    break
+            return generated_sequence
     
     def adjust_logits_during_generation(self, logits, cur_len, max_length, min_length, repetition_penalty, input_ids):
         """Adjust token logits during generation. Optimized adjustment with vectorized operations."""
