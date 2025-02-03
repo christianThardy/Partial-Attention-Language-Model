@@ -102,27 +102,27 @@ class PALMTrainer:
         NUM_LAYERS = real_model.config.num_hidden_layers
 
         # Define Freeze Schedule
-        self.FREEZE_SCHEDULE = [
-            # Epoch 0: Only custom components and topmost layers are trainable.
-            {"epoch": 0, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 3}, 
-            {"epoch": 1, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 6},
-            # Epoch 2: Unfreeze the top 9 layers etc.
-            {"epoch": 2, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 9},
-            {"epoch": 3, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 12},
-            {"epoch": 4, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 15},
-            # Epoch 5: Unfreeze top 18 layers etc.
-            {"epoch": 5, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 18},
-            {"epoch": 6, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 21},
-            # Epoch 7: Fully unfreeze all layers (including embeddings).
-            {"epoch": 7, "freeze_embeddings": False, "freeze_up_to_layer_idx": 0},
-        ]
+        # self.FREEZE_SCHEDULE = [
+        #     # Epoch 0: Only custom components and topmost layers are trainable.
+        #     {"epoch": 0, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 3}, 
+        #     {"epoch": 1, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 6},
+        #     # Epoch 2: Unfreeze the top 9 layers etc.
+        #     {"epoch": 2, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 9},
+        #     {"epoch": 3, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 12},
+        #     {"epoch": 4, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 15},
+        #     # Epoch 5: Unfreeze top 18 layers etc.
+        #     {"epoch": 5, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 18},
+        #     {"epoch": 6, "freeze_embeddings": True, "freeze_up_to_layer_idx": NUM_LAYERS - 21},
+        #     # Epoch 7: Fully unfreeze all layers (including embeddings).
+        #     {"epoch": 7, "freeze_embeddings": False, "freeze_up_to_layer_idx": 0},
+        # ]
 
-        initial_schedule = self.FREEZE_SCHEDULE[0]
-        freeze_selected_layers(
-            self.model, 
-            freeze_embeddings=initial_schedule["freeze_embeddings"],
-            freeze_up_to_layer_idx=initial_schedule["freeze_up_to_layer_idx"]
-        )
+        # initial_schedule = self.FREEZE_SCHEDULE[0]
+        # freeze_selected_layers(
+        #     self.model, 
+        #     freeze_embeddings=initial_schedule["freeze_embeddings"],
+        #     freeze_up_to_layer_idx=initial_schedule["freeze_up_to_layer_idx"]
+        # )
         logger.info("Trainer initialized.")
         
     # Define training process
