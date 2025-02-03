@@ -11,7 +11,9 @@ from torch.cuda.amp import autocast, GradScaler
 # from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from palm.constants import *
-from palm.training.utils import freeze_selected_layers, is_custom_param
+from palm.training.utils import (
+    freeze_selected_layers, is_custom_param, 
+    continuous_unfreeze)
 
 # Transformers Schedulers
 from transformers import (
@@ -133,17 +135,20 @@ class PALMTrainer:
         NUM_LAYERS = real_model.config.num_hidden_layers
         
         for epoch in range(constants.NUM_TRAIN_EPOCHS):
+            # Calculate unfreezing progress for each epoch
+            continuous_unfreeze(model, epoch, NUM_TRAIN_EPOCHS, NUM_LAYERS)
+            
             # Check if we should switch freeze settings at this epoch
-            for schedule_stage in self.FREEZE_SCHEDULE:
-                if epoch == schedule_stage["epoch"]:
-                    freeze_selected_layers(
-                        self.model,
-                        freeze_embeddings=schedule_stage["freeze_embeddings"],
-                        freeze_up_to_layer_idx=schedule_stage["freeze_up_to_layer_idx"]
-                    )
-                    logger.info(f"Selective freezing activated at epoch {epoch}. "
-                                f"Embeddings frozen: {schedule_stage['freeze_embeddings']}, "
-                                f"Layers up to idx {schedule_stage['freeze_up_to_layer_idx']} are frozen.")
+            # for schedule_stage in self.FREEZE_SCHEDULE:
+            #     if epoch == schedule_stage["epoch"]:
+            #         freeze_selected_layers(
+            #             self.model,
+            #             freeze_embeddings=schedule_stage["freeze_embeddings"],
+            #             freeze_up_to_layer_idx=schedule_stage["freeze_up_to_layer_idx"]
+            #         )
+            #         logger.info(f"Selective freezing activated at epoch {epoch}. "
+            #                     f"Embeddings frozen: {schedule_stage['freeze_embeddings']}, "
+            #                     f"Layers up to idx {schedule_stage['freeze_up_to_layer_idx']} are frozen.")
 
             # Possibly adjust dynamic SAE weight
             if constants.USE_DYNAMIC_SAE_WEIGHT:
@@ -212,6 +217,7 @@ class PALMTrainer:
                     labels=labels, 
                     source_len=source_len
                 )
+                
             # Accumulate loss
             if combined_loss is not None:
                 combined_loss = combined_loss / constants.GRADIENT_ACCUMULATION_STEPS
