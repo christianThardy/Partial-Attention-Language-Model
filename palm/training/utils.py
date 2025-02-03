@@ -88,3 +88,20 @@ def freeze_selected_layers(model_, freeze_embeddings=True, freeze_up_to_layer_id
         param.requires_grad = True
     for param in real_model.sae_head.parameters():
         param.requires_grad = True
+
+def continuous_unfreeze(model, epoch, total_epochs, NUM_LAYERS):
+    """
+    Continuously unfreeze layers based on current epoch. 
+    Allows a smoother transition than chunk-based freezing.
+    """
+    real_model = model.module if hasattr(model, 'module') else model
+    
+    layers_to_unfreeze = int((epoch / float(total_epochs)) * NUM_LAYERS)
+    # Freeze embeddings until last epoch, or adjust logic as desired:
+    freeze_embeddings = (epoch < (total_epochs - 1))
+    
+    freeze_selected_layers(
+        model,
+        freeze_embeddings=freeze_embeddings,
+        freeze_up_to_layer_idx=real_model.config.num_hidden_layers - layers_to_unfreeze
+    )
