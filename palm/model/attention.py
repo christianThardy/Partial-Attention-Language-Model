@@ -206,7 +206,6 @@ class PALMPartialAttention(nn.Module):
         # Compute attention scores: shape (B, nHeads, T, T)
         d_k = self.attention_head_size
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) / math.sqrt(d_k)
-        attention_scores = torch.clamp(attention_scores, min=-5.0, max=5.0)
 
         # Combine partial mask with the attention_mask:
         # Turn 'source_mask' into shape (B,1,1,T) to exclude K beyond source_len
