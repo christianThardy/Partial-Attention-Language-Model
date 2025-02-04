@@ -167,7 +167,7 @@ def main():
         num_hidden_layers=NUM_HIDDEN_LAYERS,
         num_attention_heads=NUM_ATTENTION_HEADS,
         hidden_size=HIDDEN_SIZE,
-        layer_norm_eps=1e-5,
+        layer_norm_eps=LAYER_NORM_EPSILON,
         sae_weight=SAE_WEIGHT,
         gradient_checkpointing=GRADIENT_CHECKPOINTING
     )
