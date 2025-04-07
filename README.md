@@ -21,7 +21,7 @@ By encouraging the model to reconstruct and attend to the input, it stays tether
 <br>
 
 <p align="center">
-<img src="https://github.com/user-attachments/assets/ded04f01-a9e8-4dbc-91b5-b9211bb8a78a" width="1500"/>
+<img src="https://github.com/user-attachments/assets/cba3d3a1-dc58-44df-8700-21a9b4d13c31" width="1500"/>
 <br>
 <small style="font-size: 12px;">Current Progress</small>
 </p>
