@@ -4,9 +4,15 @@ import torch.nn as nn
 class PALMEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
-        # Embedding layer for word tokens
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        self.config = config
+        self.fixed_source_length = getattr(config, 'fixed_source_length', 100)
         
+        # Embedding layer for word tokens
+        self.word_embeddings = nn.Embedding(
+            config.vocab_size, 
+            config.hidden_size, 
+            padding_idx=config.pad_token_id
+        )
         # Embedding layer for positional information (e.g., position of each token in the sequence)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         
@@ -19,9 +25,6 @@ class PALMEmbeddings(nn.Module):
 
         # Dropout layer for regularization to prevent overfitting
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        
-        # Fixed length for source sequence; used to distinguish between source and target positions
-        self.fixed_source_length = config.fixed_source_length
 
     def forward(self, input_ids, position_offset=0):
         """
@@ -80,4 +83,3 @@ class PALMEmbeddings(nn.Module):
         embeddings = self.dropout(embeddings)
 
         return embeddings
-    

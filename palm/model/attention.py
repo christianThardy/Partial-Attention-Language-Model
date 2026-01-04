@@ -4,6 +4,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
 # Logger object
 logger = logging.getLogger(__name__)
@@ -26,20 +27,28 @@ class PALMAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads) # Size per attention head
         self.all_head_size = self.num_attention_heads * self.attention_head_size # Total size for all attention heads
 
+        # Pre-attention layer norm
+        self.pre_attention_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
         # Linear layers to project hidden states into query, key, and value representations
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
+        # Initialize attention projection with proper scaling
+        nn.init.normal_(self.query.weight, mean=0.0, std=0.02/math.sqrt(2 * config.num_hidden_layers))
+        nn.init.normal_(self.key.weight, mean=0.0, std=0.02/math.sqrt(2 * config.num_hidden_layers))
+        nn.init.normal_(self.value.weight, mean=0.0, std=0.02/math.sqrt(2 * config.num_hidden_layers))
+
         # Dropout layer for regularization
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-
         # Linear layer for output of the attention mechanism
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-
         # Layer normalization for stability and improved training
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
+        # Scale factor for attention scores
+        self.attention_scale = math.sqrt(self.attention_head_size)
 
     def transpose_for_scores(self, x):
         # Reshape input tensor for multi-head attention and permute dimensions
@@ -90,11 +99,11 @@ class PALMAttention(nn.Module):
             if attention_mask is not None:
                 logger.debug(f"Original attention mask shape: {attention_mask.shape}")
                 
-                # Ensure attention_mask has the correct shape (4D tensor)
+                # Only unsqueeze if attention_mask is 2D. If it's already 4D, skip it
                 if attention_mask.dim() == 2:
                     attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                elif attention_mask.dim() == 3:
-                    attention_mask = attention_mask.unsqueeze(1)
+                elif attention_mask.dim() != 4:
+                    raise ValueError(f"attention_mask must be 2D or 4D, got {attention_mask.dim()}D shape.")
                 
                 # Mask is already in additive form (0 = attend, -10000 = mask out)
                 attention_mask = attention_mask.to(dtype=torch.float32)
@@ -111,7 +120,7 @@ class PALMAttention(nn.Module):
 
             # Compute context layer
             context_layer = torch.matmul(attention_probs, value_layer)
-    
+            
             logger.debug(f"Context layer shape before permute: {context_layer.shape}")
             context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
             logger.debug(f"Context layer shape after permute: {context_layer.shape}")
@@ -127,6 +136,20 @@ class PALMAttention(nn.Module):
             attention_output = self.LayerNorm(attention_output + hidden_states)
     
             logger.debug(f"Attention output shape: {attention_output.shape}")
+
+            # Guard for any non-finite
+            if not torch.isfinite(attention_output).all():
+                attention_output = torch.where(
+                    torch.isfinite(attention_output),
+                    attention_output,
+                    torch.zeros_like(attention_output)
+                )
+                logger.warning("Non-finite values detected in attention output, zeroing them")
+
+            # KV caching parameter to return both the output and the new cached states
+            if use_cache:
+                new_past = (key_layer, value_layer)
+                return attention_output, new_past
     
             return attention_output, present_key_value
     
@@ -149,32 +172,23 @@ class PALMPartialAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
-        # Dropout layer for regularization
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob) # Dropout layer for regularization
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size) # Linear layer for output of the attention mechanism
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) # Layer normalization for stability and improved training
 
-        # Linear layer for output of the attention mechanism
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-
-        # Layer normalization for stability and improved training
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        # Fixed length for the source sequence
-        self.fixed_source_length = config.fixed_source_length
-
-        # Feed-forward network applied to the source states
+        # MLP applied to the source states
         self.Fp = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Tanh(), # Experiment with a reLu here
+            nn.ReLU(),
             nn.Dropout(config.hidden_dropout_prob),
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.Dropout(config.hidden_dropout_prob)
         )
 
     def transpose_for_scores(self, x):
-        # Reshape input tensor for multi-head attention and permute dimensions
+        # Reshape input tensor for multi-head attention and permute dimensions, (batch, seq, hidden) -> (batch, heads, seq, head_dim)
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
-
         # Permute dimensions to (batch, heads, seq_len, head_size)
         return x.permute(0, 2, 1, 3)
 
@@ -234,4 +248,3 @@ class PALMPartialAttention(nn.Module):
         attention_output = self.LayerNorm(attention_output + hidden_states)
     
         return attention_output, present_key_value
-    

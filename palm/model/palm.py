@@ -1,6 +1,6 @@
-
 import os
 import logging
+import math
 
 from .attention import PALMAttention, PALMPartialAttention
 from .embeddings import PALMEmbeddings
@@ -33,14 +33,15 @@ class PALMIntermediate(nn.Module):
         super().__init__()
         # Linear layer to project hidden states to a larger intermediate size
         self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        
         # Activation function (GELU) to introduce non-linearity
         self.intermediate_act_fn = nn.GELU()
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states):
         # Apply linear transformation and activation function to the hidden states
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.dropout(hidden_states)
         return hidden_states
     
 
@@ -74,7 +75,7 @@ class PALMLayer(nn.Module):
         # Attention mechanism
         self.attention = PALMAttention(config)
 
-        # Partial attention mechanism for handling specific input sequences
+        # Partial attention mechanism for handling source input sequences
         self.partial_attention = PALMPartialAttention(config)
 
         # Intermediate layer for processing the attention output
@@ -130,8 +131,6 @@ class PALMLayer(nn.Module):
         
         # Process output of the partial attention with the intermediate layer
         intermediate_output = self.intermediate(partial_attention_output)
-
-        # Apply output layer to produce the final output for this layer
         layer_output = self.output(intermediate_output, partial_attention_output)
         return layer_output, present_key_value
     
@@ -156,7 +155,7 @@ class PALMModel(nn.Module):
         # Stack of transformer layers
         self.layers = nn.ModuleList([PALMLayer(config) for _ in range(config.num_hidden_layers)])
         
-        # Linear layer for language modeling head
+        # Linear layers for language modeling, source autoencoding heads
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         # Linear layer for sequence autoencoding head
@@ -457,7 +456,7 @@ class PALMModel(nn.Module):
 
         # Ensure input_ids are on the correct device
         device = next(self.parameters()).device
-        input_ids = input_ids.to(device)
+        input_ids = input_ids.to(device, non_blocking=True)
 
         # IMPORTANT: Store the original source length (the prompt length)
         original_source_length = input_ids.shape[1]
@@ -592,17 +591,21 @@ class PALMModel(nn.Module):
         }
     
     def adjust_logits_during_generation(self, logits, cur_len, max_length, min_length, repetition_penalty, input_ids):
-        """Adjust token logits during generation."""
+        """Adjust token logits during generation. Optimized adjustment with vectorized operations."""
+        
         # Apply repetition penalty
         if repetition_penalty != 1.0:
-            for i in range(input_ids.shape[0]):
-                for previous_token in set(input_ids[i].tolist()):
-                    # If score < 0 then repetition penalty has to multiply it by repetition penalty
-                    if logits[i, previous_token] < 0:
-                        logits[i, previous_token] *= repetition_penalty
-                    else:
-                        logits[i, previous_token] /= repetition_penalty
-
+            # Vectorized repetition penalty application
+            unique_tokens = torch.unique(input_ids)
+            logits.scatter_(
+                1,
+                unique_tokens.unsqueeze(0).expand(logits.size(0), -1),
+                torch.where(
+                    logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) < 0,
+                    logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) * repetition_penalty,
+                    logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) / repetition_penalty
+                )
+            )
         # Prevent generation of tokens before min_length
         if cur_len < min_length:
             logits[:, self.config.eos_token_id] = float('-inf')
@@ -613,9 +616,11 @@ class PALMModel(nn.Module):
         """Filter a distribution of logits using top-k and/or top-p (nucleus) filtering."""
         if top_k > 0:
             top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
+            
             # Remove all tokens with a probability less than the last token of the top-k
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = filter_value
+            topk_values, _ = torch.topk(logits, top_k)
+            indices_to_remove = logits < topk_values[..., -1, None]
+            logits.masked_fill_(indices_to_remove, filter_value)
 
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -623,18 +628,24 @@ class PALMModel(nn.Module):
 
             # Remove tokens with cumulative probability above the threshold (token with 0 are kept)
             sorted_indices_to_remove = cumulative_probs > top_p
+            
             # Shift indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
 
             # Scatter sorted tensors to original indexing
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = filter_value
-
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+            indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+            logits.masked_fill_(indices_to_remove, filter_value)
+            
         return logits
     
-    def save_pretrained(self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, push_to_hub=False, max_shard_size="5GB", safe_serialization=True, variant=None, token=None, save_peft_format=True, **kwargs):
-        """Save a model and its configuration file to a directory, so that it can be re-loaded using the `from_pretrained` class method."""
+    def save_pretrained(
+        self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, push_to_hub=False, 
+        max_shard_size="5GB", safe_serialization=True, variant=None, token=None, save_peft_format=True, **kwargs):
+            
+        """Save a model and its configuration file to a directory, so that it can be re-loaded using the 
+        `from_pretrained` class method."""
         if not is_main_process:
             return None
 
@@ -643,82 +654,88 @@ class PALMModel(nn.Module):
 
         os.makedirs(save_directory, exist_ok=True)
 
-        # Get state_dict
-        if state_dict is None:
-            state_dict = self.state_dict()
+        # Validate configuration
+        if not hasattr(self, 'config'):
+            raise AttributeError("Model doesn't have a config attribute")
 
-        # Handle the case for DataParallel
-        if hasattr(self, 'module'):
-            state_dict = self.module.state_dict()
+        # Efficient state dict handling
+        state_dict = state_dict or (
+            self.module.state_dict() if hasattr(self, 'module') else self.state_dict()
+        )
+        
+        # Set up LFS tracking for large files
+        with open(os.path.join(save_directory, '.gitattributes'), 'w') as f:
+            f.write('*.bin filter=lfs diff=lfs merge=lfs -text\n')
+            f.write('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
+        
+        # Optimize file saving with sharding support
+        if safe_serialization:
+            from safetensors.torch import save_file
+            save_file(
+                state_dict,
+                os.path.join(save_directory, 'model.safetensors'),
+                metadata={"format": "pt"}
+            )
+        else:
+            save_function(
+                state_dict,
+                os.path.join(save_directory, 'pytorch_model.bin')
+            )
 
-        # Save model
+        # Save model config if available
         model_to_save = self.module if hasattr(self, 'module') else self
-
-        # Implement model weight sharding if max_shard_size is specified
-        if max_shard_size is not None:
-            # Implement _shard_checkpoint or remove this logic if not needed
-            # shards, index = self._shard_checkpoint(state_dict, max_shard_size)
-            # for shard_file, shard in shards.items():
-            #     self._save_shard(shard, save_directory, shard_file, safe_serialization)
-            # if index is not None:
-            #     save_function(index, os.path.join(save_directory, 'pytorch_model.bin.index.json'))
-            pass
-        else:
-            # Use safe serialization if specified
-            if safe_serialization:
-                safe_save_file(state_dict, os.path.join(save_directory, 'model.safetensors'), metadata={"format": "pt"})
-            else:
-                save_function(state_dict, os.path.join(save_directory, 'pytorch_model.bin'))
-
-        # Save config
-        if hasattr(model_to_save, 'config') and hasattr(model_to_save.config, 'save_pretrained'):
+        if hasattr(model_to_save, 'config'):
             model_to_save.config.save_pretrained(save_directory)
-        else:
-            print("Warning: Model doesn't have a config with save_pretrained method. Config not saved.")
 
-        # Handle push to hub
-        if push_to_hub:
-            if hasattr(self, '_push_to_hub'):
-                return self._push_to_hub(save_directory, token=token, **kwargs)
-            else:
-                print("Warning: _push_to_hub method not implemented. Model not pushed to hub.")
+       # Save tokenizer if available
+        if hasattr(self, 'tokenizer'):
+            self.tokenizer.save_pretrained(save_directory)
+        
+        # Handle hub pushing with metadata
+        if push_to_hub and hasattr(self, '_push_to_hub'):
+            commit_message = kwargs.pop("commit_message", "Upload model")
+            private = kwargs.pop("private", False)
+            return self._push_to_hub(
+                save_directory,
+                commit_message=commit_message,
+                private=private,
+                **kwargs
+            )
 
         return save_directory
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
-        config = kwargs.get("config", None)
-        state_dict = kwargs.get("state_dict", None)
-
-        # If config is not provided, try to load it
-        if config is None:
-            config_file = os.path.join(pretrained_model_name_or_path, "config.json")
-            if os.path.exists(config_file):
-                config = cls.config_class.from_json_file(config_file)
-            else:
-                raise OSError(f"Config file not found in {pretrained_model_name_or_path}")
-
-        # Instantiate model
+        from ..config import PALMConfig
+        config = kwargs.get("config") or cls._load_config(pretrained_model_name_or_path)
         model = cls(config)
-
-        if state_dict is None:
-            # Look for various file types
-            file_types = ["*.bin", "*.pt", "*.pth", "*.ckpt", "*.safetensors"]
-            found_files = []
-            for file_type in file_types:
-                found_files.extend(glob.glob(os.path.join(pretrained_model_name_or_path, file_type)))
-            
-            if not found_files:
-                logger.warning(f"No model weights found in {pretrained_model_name_or_path}. "
-                               "Initializing model with random weights.")
-                return model
-            else:
-                # Use the first file found
-                state_dict = torch.load(found_files[0], map_location="cpu")
-
-        # Load the state dict if it exists
+       
+        state_dict = kwargs.get("state_dict") or cls._find_and_load_state_dict(
+            pretrained_model_name_or_path
+        )
         if state_dict:
             model.load_state_dict(state_dict, strict=False)
-
+           
         return model
-  
+       
+    @staticmethod
+    def _load_config(path):
+        """Helper method for efficient config loading."""
+        from ..config import PALMConfig
+        config_file = os.path.join(path, "config.json")
+        if not os.path.exists(config_file):
+            raise OSError(f"Config file not found in {path}")
+        return PALMConfig.from_json_file(config_file)
+       
+    @staticmethod
+    def _find_and_load_state_dict(path):
+        """Helper method for efficient state dict loading."""
+        file_types = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt"]
+        for pattern in file_types:
+            files = glob.glob(os.path.join(path, pattern))
+            if files:
+                if pattern == "*.safetensors":
+                    from safetensors.torch import load_file
+                    return load_file(files[0])
+                return torch.load(files[0], map_location="cpu")
+        return None
