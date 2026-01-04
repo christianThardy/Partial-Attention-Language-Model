@@ -4,7 +4,7 @@ Large language models often show **context rot** in long generations: progressiv
 
 In standard decoder-only transformers, this degradation is driven by how attention and the residual stream become increasingly dominated by the model's own continuation, weakening effective access to the original source tokens as generation continues.
 
-PALM is a decoder-only architecture that preserves source connectivity throughout decoding by introducing a partial attention pathway: generated tokens can attend directly to the full source prefix at every step, while maintaining causal structure over the generated continuation. 
+**PALM** is a decoder-only architecture that preserves source connectivity throughout decoding by introducing a partial attention pathway: generated tokens can attend directly to the full source prefix at every step, while maintaining causal structure over the generated continuation. 
 
 This creates a stable channel for conditioning on retrieved documents, system constraints, and prompt instructions, improving source–target coherence and reducing attention degeneration during conditional text generation.
 
