@@ -114,3 +114,46 @@ from .paper_metrics import (
     save_paper_metrics,
     load_paper_metrics,
 )
+
+# =============================================================================
+# Context Rot Evaluation Suite
+# =============================================================================
+from .context_rot import (
+    # Levenshtein utilities
+    normalized_levenshtein_score,
+    # Repeated Words (Chroma benchmark)
+    RepeatedWordsResult,
+    RepeatedWordsSummary,
+    # Needle tests
+    NeedleTestResult,
+    DistractorTestResult,
+    FocusedVsFullResult,
+    ContextRotSuiteResult,
+    # Evaluator
+    ContextRotEvaluator,
+    # Plotting & I/O
+    plot_context_rot_results,
+    plot_repeated_words_curve,
+    save_context_rot_results,
+    load_context_rot_results,
+)
+
+# =============================================================================
+# Lightweight Context Rot Probes (During-Training)
+# =============================================================================
+from .context_rot_probes import (
+    ContextRotProbeResult,
+    run_context_rot_probes,
+    format_probe_results,
+)
+
+# =============================================================================
+# Go/No-Go Assessment
+# =============================================================================
+from .go_nogo import (
+    GoNoGoCriteria,
+    CriterionResult,
+    GoNoGoAssessment,
+    assess_go_nogo,
+    save_go_nogo_assessment,
+)

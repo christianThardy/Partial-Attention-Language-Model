@@ -84,19 +84,23 @@ class PALMLayer(nn.Module):
         # Output layer to produce the final output for this layer
         self.output = PALMOutput(config)
 
-    def forward(self, hidden_states, attention_mask=None, source_hidden_states=None,
+    def forward(self, hidden_states, attention_mask=None, source_len=None,
                 past_key_value=None, use_cache=False):
         """
         Args:
             hidden_states: Input tensor
             attention_mask: Attention mask in additive form
-            source_hidden_states: Source states for partial attention
+            source_len: Length of source sequence (int or tensor) for extracting source from attention output
             past_key_value: Tuple of ((attn_key, attn_value), (partial_key, partial_value))
             use_cache: Whether to return key/values for caching
         
         Returns:
             layer_output: Output tensor
             present_key_value: Tuple of caches if use_cache=True, else None
+        
+        Note: Paper refines source representations through each layer. We extract
+              source_hidden_states from attention_output[:, :source_len] INSIDE each layer,
+              not from static embeddings passed through the network.
         """
         # Unpack past key values if provided
         past_attn_kv = None
@@ -110,11 +114,21 @@ class PALMLayer(nn.Module):
             past_key_value=past_attn_kv, use_cache=use_cache
         )
 
-        # Apply partial attention using source hidden states
-        # For incremental decoding with cache, source_hidden_states is None because K/V are cached
-        if source_hidden_states is None and past_partial_kv is None:
-            # Fallback: extract from hidden_states if possible
-            source_hidden_states = hidden_states[:, :self.config.fixed_source_length]
+        # Paper: Extract source_hidden_states from THIS LAYER's attention output
+        # This allows source representations to be progressively refined through layers
+        # rather than using static embeddings
+        source_hidden_states = None
+        if past_partial_kv is None:
+            # First forward pass or no caching: extract source from attention output
+            if source_len is None:
+                source_len = self.config.fixed_source_length
+            if isinstance(source_len, torch.Tensor):
+                max_source_len = int(source_len.max().item())
+            else:
+                max_source_len = int(source_len)
+            max_source_len = min(max_source_len, attention_output.size(1))
+            source_hidden_states = attention_output[:, :max_source_len]
+        # If past_partial_kv is provided, source K/V are already cached
         
         partial_attention_output, present_partial_kv = self.partial_attention(
             attention_output,
@@ -340,39 +354,34 @@ class PALMModel(nn.Module):
             else:
                 hidden_states = self.embeddings(input_ids, position_offset=position_offset)
             
-            # For first forward pass (no cache), get source hidden states
-            # For incremental decoding, source K/V is already cached in partial attention
-            if past_key_values is None:
-                # Use max source_len for source_hidden_states extraction
-                max_source_len = min(source_len.max().item(), seq_length)
-                source_hidden_states = hidden_states[:, :int(max_source_len)]
-            else:
-                # Incremental: source states not needed as K/V are cached
-                source_hidden_states = None
+            # Calculate max source length for layers (each layer extracts source from its attention output)
+            max_source_len = min(source_len.max().item(), seq_length)
+            max_source_len = int(max_source_len)
     
             # Initialize present key values list
             present_key_values = [] if use_cache else None
     
             # Pass through each layer with caching
+            # Note: Each layer extracts source_hidden_states from its own attention output
+            # This allows source representations to be progressively refined (paper design)
             for i, layer in enumerate(self.layers):
                 layer_past_kv = past_key_values[i] if past_key_values is not None else None
                 
                 # Use gradient checkpointing if enabled and training (saves memory)
                 if self.gradient_checkpointing and self.training and not use_cache:
                     # Gradient checkpointing wrapper - recomputes activations during backward
-                    def create_custom_forward(module):
-                        def custom_forward(hidden_states, attention_mask, source_hidden_states):
+                    def create_custom_forward(module, src_len):
+                        def custom_forward(hidden_states, attention_mask):
                             outputs = module(hidden_states, attention_mask, 
-                                           source_hidden_states=source_hidden_states,
+                                           source_len=src_len,
                                            past_key_value=None, use_cache=False)
                             return outputs[0]  # Only return hidden_states
                         return custom_forward
                     
                     hidden_states = gradient_checkpoint(
-                        create_custom_forward(layer),
+                        create_custom_forward(layer, max_source_len),
                         hidden_states,
                         attention_mask,
-                        source_hidden_states,
                         use_reentrant=False
                     )
                     present_kv = None
@@ -380,7 +389,7 @@ class PALMModel(nn.Module):
                     hidden_states, present_kv = layer(
                         hidden_states, 
                         attention_mask,
-                        source_hidden_states=source_hidden_states,
+                        source_len=max_source_len if past_key_values is None else None,
                         past_key_value=layer_past_kv,
                         use_cache=use_cache
                     )

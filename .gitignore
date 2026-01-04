@@ -1,3 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
 # Notebooks
 /notebooks/*
 
@@ -6,4 +11,4 @@
 /tests/test_cuda.py
 
 # Other
-/.pytest_cache/
+.pytest_cache/

@@ -5,9 +5,9 @@ PUSH_TO_HUB = True
 
 MODEL_NAME = "meta-llama/Llama-3.2-3B"
 DATASET_1_NAME = "ola13/small-the_pile"
-DS1_MAX_SAMPLES = 
+DS1_MAX_SAMPLES = 10000
 DATASET_2_NAME = ""
-DS2_MAX_SAMPLES = 
+DS2_MAX_SAMPLES = 10000
 
 TRAIN_BATCH_SIZE = 16 # Number of samples processed before the model's internal parameters are updated during training
 EVAL_BATCH_SIZE = 16 # Number of samples processed during evaluation to calculate metrics
@@ -43,7 +43,7 @@ EARLY_STOP_PATIENCE = 3
 
 USE_FREEZE_IN_CHUNKS = False # Freeze/unfreeze layers chunk-by-chunk over certain steps
 USE_DYNAMIC_SAE_WEIGHT = False # Vary the SAE weight across epochs
-USE_ALL_LAYERS_SMALL_LR = # Train all layers from the start with smaller LR for base
+USE_ALL_LAYERS_SMALL_LR = False  # Train all layers from the start with smaller LR for base
 USE_COSINE_DECAY = True # Learning rate schedule
 USE_POLYNOMIAL_DECAY = False # Learning rate schedule
 USE_LORA = False # Apply LoRA adapters

@@ -2,20 +2,54 @@ import torch
 import math
 import logging
 
-from rouge import Rouge
-from bert_score import score
-
-import evaluate
-from tqdm import tqdm
-
 logger = logging.getLogger(__name__)
+
+# Optional dependencies for evaluation metrics
+# These are only needed for specific evaluation functions, not core functionality
+_ROUGE_AVAILABLE = False
+_BERT_SCORE_AVAILABLE = False
+_EVALUATE_AVAILABLE = False
+_TQDM_AVAILABLE = False
+
+try:
+    from rouge import Rouge
+    _ROUGE_AVAILABLE = True
+except ImportError:
+    Rouge = None
+
+try:
+    from bert_score import score as bert_score_fn
+    _BERT_SCORE_AVAILABLE = True
+except ImportError:
+    bert_score_fn = None
+
+try:
+    import evaluate
+    _EVALUATE_AVAILABLE = True
+except ImportError:
+    evaluate = None
+
+try:
+    from tqdm import tqdm
+    _TQDM_AVAILABLE = True
+except ImportError:
+    # Fallback tqdm that just returns the iterable
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
 def calculate_rouge(reference, hypothesis):
     """
     Calculates ROUGE-L F1 score between single 'reference' and 'hypothesis'.
     Uses python-rouge's get_scores method.
+    
+    Requires: pip install rouge
     """
+    if not _ROUGE_AVAILABLE:
+        raise ImportError(
+            "Rouge is required for calculate_rouge. Install with: pip install rouge"
+        )
+    
     # Initialize ROUGE metric object
     rouge = Rouge()
 
@@ -29,9 +63,16 @@ def calculate_bert_score(reference, hypothesis):
     """
     Calculates BERTScore F1 between single 'reference' and 'hypothesis'.
     Uses bert_score library's score() method. Returns float F1.
+    
+    Requires: pip install bert-score
     """
+    if not _BERT_SCORE_AVAILABLE:
+        raise ImportError(
+            "bert_score is required for calculate_bert_score. Install with: pip install bert-score"
+        )
+    
     # Calculate BERTScore F1 score between the hypothesis and reference texts
-    _, _, f1 = score([hypothesis], [reference], lang="en")
+    _, _, f1 = bert_score_fn([hypothesis], [reference], lang="en")
     # Return F1 score as a scalar value
     return f1.item()
 
@@ -112,8 +153,14 @@ def compute_text_generation_metrics(predictions, references):
     """
     Computes multiple text generation metrics (e.g. BLEU, METEOR, ROUGE) in one pass
     using Hugging Face evaluate method. Returns dict of scores.
+    
+    Requires: pip install evaluate
     """
     metrics_dict = {}
+
+    if not _EVALUATE_AVAILABLE:
+        logger.warning("evaluate module not installed. Install with: pip install evaluate")
+        return metrics_dict
 
     # Example: Using evaluate.load for BLEU
     try:
@@ -122,7 +169,7 @@ def compute_text_generation_metrics(predictions, references):
         refs_tok = [[r.strip().split()] for r in references]  # HF BLEU expects list-of-lists
         bleu_score = bleu_metric.compute(predictions=preds_tok, references=refs_tok)["bleu"]
         metrics_dict["BLEU"] = bleu_score
-    except:
+    except Exception:
         pass  # skip if 'bleu' not installed or other error
 
     # METEOR
@@ -130,7 +177,7 @@ def compute_text_generation_metrics(predictions, references):
         meteor_metric = evaluate.load("meteor")
         meteor_score = meteor_metric.compute(predictions=predictions, references=references)["meteor"]
         metrics_dict["METEOR"] = meteor_score
-    except:
+    except Exception:
         pass
 
     # ROUGE
@@ -139,7 +186,7 @@ def compute_text_generation_metrics(predictions, references):
         rouge_score = rouge_metric.compute(predictions=predictions, references=references)
         # use rougeL F1 as an example
         metrics_dict["ROUGEL"] = rouge_score["rougeL"].mid.fmeasure
-    except:
+    except Exception:
         pass
 
     return metrics_dict

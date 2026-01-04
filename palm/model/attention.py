@@ -176,14 +176,14 @@ class PALMPartialAttention(nn.Module):
         self.dense = nn.Linear(config.hidden_size, config.hidden_size) # Linear layer for output of the attention mechanism
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) # Layer normalization for stability and improved training
 
-        # MLP applied to the source states
-        self.Fp = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.ReLU(),
-            nn.Dropout(config.hidden_dropout_prob),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Dropout(config.hidden_dropout_prob)
-        )
+        # MLP applied to the source states (Fp network from paper)
+        # Paper uses Pl = Pl2 + Pl1 (residual connection after two linear layers)
+        self.Fp_linear1 = nn.Linear(config.hidden_size, config.hidden_size)
+        self.Fp_activation = nn.ReLU()
+        # self.Fp_activation = nn.Tanh()  # Paper uses tanh - uncomment to try tanh vs ReLU
+        self.Fp_dropout1 = nn.Dropout(config.hidden_dropout_prob)
+        self.Fp_linear2 = nn.Linear(config.hidden_size, config.hidden_size)
+        self.Fp_dropout2 = nn.Dropout(config.hidden_dropout_prob)
 
     def transpose_for_scores(self, x):
         # Reshape input tensor for multi-head attention and permute dimensions, (batch, seq, hidden) -> (batch, heads, seq, head_dim)
@@ -210,8 +210,14 @@ class PALMPartialAttention(nn.Module):
             # Reuse cached source K/V
             key_layer, value_layer = past_key_value
         else:
-            # Compute K/V from source states
-            P = self.Fp(source_states)
+            # Compute K/V from source states through Fp network
+            # Paper: Pl = Fp(source) with residual connection: Pl = Pl2 + Pl1
+            Pl1 = self.Fp_linear1(source_states)
+            Pl1 = self.Fp_activation(Pl1)
+            Pl1 = self.Fp_dropout1(Pl1)
+            Pl2 = self.Fp_linear2(Pl1)
+            Pl2 = self.Fp_dropout2(Pl2)
+            P = Pl2 + Pl1  # Residual connection as per paper
             key_layer = self.transpose_for_scores(self.key(P))
             value_layer = self.transpose_for_scores(self.value(P))
         

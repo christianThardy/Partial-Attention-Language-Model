@@ -1,6 +1,6 @@
 # Partial Attention Language Model (PALM)
 
-Large language models often show **context rot** in long generations: progressive **attention degradation** and loss of grounding on earlier context manifests as instruction drift, hallucination, "forgetting" and reduced adherence to retrieved evidence or constraints.
+Large language models often show **context rot** in long generations: progressive **attention degradation** and loss of grounding on earlier context manifests as instruction drift, hallucination, and forgetting; reduced adherence to retrieved evidence or constraints.
 
 In standard decoder-only transformers, this degradation is driven by how attention and the residual stream become increasingly dominated by the model's own continuation, weakening effective access to the original source tokens as generation continues.
 

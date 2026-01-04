@@ -270,6 +270,9 @@ def transfer_weights_to_palm(
     # Load the modified state dict
     palm_model.load_state_dict(palm_state, strict=False)
     
+    # Bootstrap PALM-specific components from pretrained weights (architecture-aware)
+    palm_state = bootstrap_palm_components(palm_model, source_state, palm_state, arch_type=arch_type)
+    
     # Clean up source model to free memory
     del source_model
     del source_state
@@ -282,8 +285,283 @@ def transfer_weights_to_palm(
     logger.info(f"  - Shape mismatches: {shape_mismatch} tensors")
     
     # Log which PALM components are initialized fresh
-    fresh_components = ['partial_attention', 'sae_head', 'Fp', 'language_embeddings', 'position_embeddings']
+    fresh_components = ['language_embeddings', 'position_embeddings']
     logger.info(f"Components initialized fresh (not from pretrained): {fresh_components}")
     
     return palm_model
+
+
+# =============================================================================
+# PALM COMPONENT BOOTSTRAPPING
+# =============================================================================
+
+def _get_attention_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str]:
+    """
+    Get source attention key patterns for a given architecture.
+    
+    Returns dict mapping projection type to source key pattern.
+    """
+    i = layer_idx
+    
+    if arch_type in ['llama', 'mistral', 'gemma']:
+        return {
+            'q': f'model.layers.{i}.self_attn.q_proj.weight',
+            'k': f'model.layers.{i}.self_attn.k_proj.weight',
+            'v': f'model.layers.{i}.self_attn.v_proj.weight',
+            'o': f'model.layers.{i}.self_attn.o_proj.weight',
+            'norm': f'model.layers.{i}.input_layernorm.weight',
+            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+        }
+    elif arch_type == 'qwen':
+        # Try Qwen2 style first (more common now), fallback patterns handled at call site
+        return {
+            'q': f'model.layers.{i}.self_attn.q_proj.weight',
+            'k': f'model.layers.{i}.self_attn.k_proj.weight',
+            'v': f'model.layers.{i}.self_attn.v_proj.weight',
+            'o': f'model.layers.{i}.self_attn.o_proj.weight',
+            'norm': f'model.layers.{i}.input_layernorm.weight',
+            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+            # Qwen1 fallbacks
+            'q_alt': f'transformer.h.{i}.attn.q_proj.weight',
+            'k_alt': f'transformer.h.{i}.attn.k_proj.weight',
+            'v_alt': f'transformer.h.{i}.attn.v_proj.weight',
+            'o_alt': f'transformer.h.{i}.attn.c_proj.weight',
+            'norm_alt': f'transformer.h.{i}.ln_1.weight',
+        }
+    elif arch_type == 'phi':
+        return {
+            'q': f'model.layers.{i}.self_attn.q_proj.weight',
+            'k': f'model.layers.{i}.self_attn.k_proj.weight',
+            'v': f'model.layers.{i}.self_attn.v_proj.weight',
+            'o': f'model.layers.{i}.self_attn.dense.weight',
+            'norm': f'model.layers.{i}.input_layernorm.weight',
+            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+        }
+    elif arch_type == 'falcon':
+        # Falcon uses fused QKV - can't bootstrap partial attention from it
+        return {
+            'q': None,  # Fused QKV not supported
+            'k': None,
+            'v': None,
+            'o': f'transformer.h.{i}.self_attention.dense.weight',
+            'norm': f'transformer.h.{i}.input_layernorm.weight',
+            'norm_bias': f'transformer.h.{i}.input_layernorm.bias',
+        }
+    else:
+        # Default to Llama-style (most common)
+        return {
+            'q': f'model.layers.{i}.self_attn.q_proj.weight',
+            'k': f'model.layers.{i}.self_attn.k_proj.weight',
+            'v': f'model.layers.{i}.self_attn.v_proj.weight',
+            'o': f'model.layers.{i}.self_attn.o_proj.weight',
+            'norm': f'model.layers.{i}.input_layernorm.weight',
+            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+        }
+
+
+def bootstrap_palm_components(
+    palm_model: torch.nn.Module,
+    source_state: Dict[str, torch.Tensor],
+    palm_state: Dict[str, torch.Tensor],
+    arch_type: str = 'llama'
+) -> Dict[str, torch.Tensor]:
+    """
+    Bootstrap PALM-specific components from pretrained weights for better initialization.
+    
+    Strategy:
+    1. sae_head ← clone from lm_head (both predict tokens from hidden states)
+    2. partial_attention Q/K/V/dense ← clone from regular attention Q/K/V/o_proj
+       - Uses repeat_interleave for GQA→MHA expansion (not slicing)
+    3. partial_attention LayerNorm ← clone from input_layernorm (prevents activation shock)
+    4. Fp network ← identity-like init with Fp_linear2 = 0 (Fp(x) ≈ x initially)
+    
+    This provides a much better starting point than random initialization:
+    - Lower initial SAE loss (starting from reasonable token prediction)
+    - Faster convergence (partial attention already "knows" how to attend)
+    - No activation shock (LayerNorm scales match pretrained model)
+    - More stable training (Fp outputs 0 initially, residual dominates)
+    
+    Supports architectures: Llama, Mistral, Gemma, Qwen, Qwen2, Phi, Falcon (partial)
+    
+    Args:
+        palm_model: The PALM model (for config access)
+        source_state: State dict from source pretrained model
+        palm_state: State dict from PALM model (will be modified in-place)
+        arch_type: Architecture type ('llama', 'qwen', 'mistral', 'phi', 'gemma', 'falcon')
+    
+    Returns:
+        Modified palm_state dict
+    """
+    num_layers = palm_model.config.num_hidden_layers
+    bootstrapped_components = []
+    
+    # 1. SAE HEAD ← CLONE FROM LM_HEAD
+    # Both project hidden_size → vocab_size, both predict tokens
+    if 'lm_head.weight' in source_state and 'sae_head.weight' in palm_state:
+        src_weight = source_state['lm_head.weight']
+        dst_dtype = palm_state['sae_head.weight'].dtype
+        palm_state['sae_head.weight'] = src_weight.clone().to(dst_dtype)
+        bootstrapped_components.append('sae_head')
+        logger.info("✓ Bootstrapped sae_head from lm_head")
+    
+    # 2. PARTIAL ATTENTION Q/K/V/DENSE ← CLONE FROM REGULAR ATTENTION
+    # This gives partial attention a head start with coherent attention patterns
+    partial_attention_bootstrapped = 0
+    for i in range(num_layers):
+        # Get architecture-specific key patterns
+        patterns = _get_attention_key_patterns(arch_type, i)
+        
+        # Map source attention → partial attention (architecture-aware)
+        mappings = [
+            (patterns['q'], f'layers.{i}.partial_attention.query.weight'),
+            (patterns['k'], f'layers.{i}.partial_attention.key.weight'),
+            (patterns['v'], f'layers.{i}.partial_attention.value.weight'),
+            (patterns['o'], f'layers.{i}.partial_attention.dense.weight'),
+        ]
+        
+        # Add fallback patterns for Qwen1 if primary not found
+        if arch_type == 'qwen':
+            fallback_mappings = [
+                (patterns.get('q_alt'), f'layers.{i}.partial_attention.query.weight'),
+                (patterns.get('k_alt'), f'layers.{i}.partial_attention.key.weight'),
+                (patterns.get('v_alt'), f'layers.{i}.partial_attention.value.weight'),
+                (patterns.get('o_alt'), f'layers.{i}.partial_attention.dense.weight'),
+            ]
+        else:
+            fallback_mappings = []
+        
+        for src_key, dst_key in mappings:
+            # Skip if source key is None (e.g., Falcon's fused QKV)
+            if src_key is None:
+                continue
+            
+            # Try primary key, then fallback for Qwen1
+            actual_src_key = src_key
+            if src_key not in source_state and fallback_mappings:
+                # Find matching fallback
+                for fb_src, fb_dst in fallback_mappings:
+                    if fb_dst == dst_key and fb_src and fb_src in source_state:
+                        actual_src_key = fb_src
+                        break
+            
+            if actual_src_key not in source_state or dst_key not in palm_state:
+                continue
+                
+            src_w = source_state[actual_src_key]
+            dst_w = palm_state[dst_key]
+            dst_dtype = dst_w.dtype
+            
+            if src_w.shape == dst_w.shape:
+                palm_state[dst_key] = src_w.clone().to(dst_dtype)
+            else:
+                # Handle GQA → MHA expansion using repeat_interleave
+                # Source GQA has fewer K/V heads than PALM's full MHA
+                # We repeat each source head to fill the destination heads
+                if dst_w.shape[0] > src_w.shape[0] and dst_w.shape[0] % src_w.shape[0] == 0:
+                    # GQA → MHA: repeat K/V heads to match destination
+                    num_repeats = dst_w.shape[0] // src_w.shape[0]
+                    expanded = src_w.repeat_interleave(num_repeats, dim=0)
+                    # Handle input dimension if also different
+                    if expanded.shape[1] != dst_w.shape[1]:
+                        min_in = min(expanded.shape[1], dst_w.shape[1])
+                        palm_state[dst_key][:, :min_in] = expanded[:, :min_in].clone().to(dst_dtype)
+                    else:
+                        palm_state[dst_key] = expanded.clone().to(dst_dtype)
+                    logger.debug(f"GQA→MHA expand {actual_src_key} {src_w.shape} -> {dst_key} {dst_w.shape} (repeat {num_repeats}x)")
+                else:
+                    # Fallback: partial transfer for other mismatches
+                    min_out = min(src_w.shape[0], dst_w.shape[0])
+                    min_in = min(src_w.shape[1], dst_w.shape[1])
+                    palm_state[dst_key][:min_out, :min_in] = src_w[:min_out, :min_in].clone().to(dst_dtype)
+                    logger.debug(f"Partial bootstrap {actual_src_key} {src_w.shape} -> {dst_key} {dst_w.shape}")
+            
+            partial_attention_bootstrapped += 1
+    
+    if partial_attention_bootstrapped > 0:
+        bootstrapped_components.append('partial_attention')
+        logger.info(f"✓ Bootstrapped partial_attention Q/K/V/dense for {num_layers} layers "
+                   f"({partial_attention_bootstrapped} tensors)")
+    
+    # 3. LAYERNORM CLONING ← CLONE INPUT_LAYERNORM TO PARTIAL_ATTENTION
+    # The trained LayerNorm weights compensate for activation drift in that specific layer.
+    # Using default LayerNorm (scale=1.0) with cloned attention weights causes "activation shock".
+    # Clone input_layernorm.weight to partial_attention's LayerNorm for proper scaling.
+    layernorm_bootstrapped = 0
+    for i in range(num_layers):
+        # Get architecture-specific LayerNorm key
+        patterns = _get_attention_key_patterns(arch_type, i)
+        src_norm_key = patterns.get('norm')
+        src_bias_key = patterns.get('norm_bias')
+        dst_norm_key = f'layers.{i}.partial_attention.LayerNorm.weight'
+        dst_bias_key = f'layers.{i}.partial_attention.LayerNorm.bias'
+        
+        # Try primary key, then fallback (for Qwen1)
+        if src_norm_key and src_norm_key not in source_state:
+            alt_key = patterns.get('norm_alt')
+            if alt_key and alt_key in source_state:
+                src_norm_key = alt_key
+        
+        if src_norm_key and src_norm_key in source_state and dst_norm_key in palm_state:
+            src_norm = source_state[src_norm_key]
+            dst_dtype = palm_state[dst_norm_key].dtype
+            palm_state[dst_norm_key] = src_norm.clone().to(dst_dtype)
+            layernorm_bootstrapped += 1
+        
+        # Also clone bias if present
+        if src_bias_key and src_bias_key in source_state and dst_bias_key in palm_state:
+            palm_state[dst_bias_key] = source_state[src_bias_key].clone().to(palm_state[dst_bias_key].dtype)
+    
+    if layernorm_bootstrapped > 0:
+        bootstrapped_components.append('partial_attention_LayerNorm')
+        logger.info(f"✓ Cloned input_layernorm to partial_attention.LayerNorm for {layernorm_bootstrapped} layers")
+    
+    # 4. Fp NETWORK ← IDENTITY-LIKE INITIALIZATION
+    # Goal: Fp(x) ≈ x initially, so partial attention starts by just copying source
+    # Paper uses Pl = Pl2 + Pl1 (residual), so we want:
+    #   - Fp_linear1 ≈ identity (with small noise)
+    #   - Fp_linear2 ≈ small values (residual dominates)
+    fp_initialized = 0
+    for i in range(num_layers):
+        fp_prefix = f'layers.{i}.partial_attention'
+        
+        # Fp_linear1: Initialize close to identity
+        fp1_key = f'{fp_prefix}.Fp_linear1.weight'
+        if fp1_key in palm_state:
+            weight = palm_state[fp1_key]
+            hidden_size = weight.shape[0]
+            device = weight.device
+            dtype = weight.dtype
+            
+            # Small random noise + scaled identity for residual path
+            # The identity component ensures Fp(x) ≈ x initially
+            identity_like = torch.eye(hidden_size, device=device, dtype=dtype)
+            palm_state[fp1_key] = 0.01 * torch.randn_like(weight) + 0.1 * identity_like
+            fp_initialized += 1
+        
+        # Fp_linear2: Initialize to ZERO (not small noise)
+        # With ReLU activation between Fp_linear1 and Fp_linear2, small noise can still
+        # produce non-zero outputs. Zero init ensures Fp block outputs exactly 0 initially,
+        # letting the residual connection dominate completely.
+        fp2_key = f'{fp_prefix}.Fp_linear2.weight'
+        if fp2_key in palm_state:
+            palm_state[fp2_key] = torch.zeros_like(palm_state[fp2_key])
+            fp_initialized += 1
+        
+        # Zero biases if present (lets the weight matrices do the work)
+        for bias_key in [f'{fp_prefix}.Fp_linear1.bias', f'{fp_prefix}.Fp_linear2.bias']:
+            if bias_key in palm_state:
+                palm_state[bias_key] = torch.zeros_like(palm_state[bias_key])
+    
+    if fp_initialized > 0:
+        bootstrapped_components.append('Fp_network')
+        logger.info(f"✓ Initialized Fp network as near-identity (residual-dominant) "
+                   f"({fp_initialized} tensors)")
+    
+    # Load the modified state dict back to model
+    palm_model.load_state_dict(palm_state, strict=False)
+    
+    if bootstrapped_components:
+        logger.info(f"PALM component bootstrapping complete: {bootstrapped_components}")
+    
+    return palm_state
 

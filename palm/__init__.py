@@ -1,5 +1,5 @@
 from .config import PALMConfig
-from .model import PALMModel, transfer_weights_to_palm
+from .model import PALMModel, transfer_weights_to_palm, bootstrap_palm_components
 from .data import load_and_split_dataset, preprocess_function, create_data_loaders
 from .training import PALMTrainer, collate_fn, apply_lora, apply_qlora, maybe_apply_lora
 
@@ -64,6 +64,24 @@ try:
         plot_combined_paper_metrics,
         save_paper_metrics,
         load_paper_metrics,
+        # =================================================================
+        # Context Rot Evaluation Suite
+        # =================================================================
+        ContextRotSuiteResult,
+        ContextRotEvaluator,
+        plot_context_rot_results,
+        save_context_rot_results,
+        # Lightweight probes for during-training
+        ContextRotProbeResult,
+        run_context_rot_probes,
+        format_probe_results,
+        # =================================================================
+        # Go/No-Go Assessment
+        # =================================================================
+        GoNoGoCriteria,
+        GoNoGoAssessment,
+        assess_go_nogo,
+        save_go_nogo_assessment,
     )
 except ImportError:
     pass  # Evaluation dependencies not installed

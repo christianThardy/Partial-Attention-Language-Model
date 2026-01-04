@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn as nn
 
@@ -38,6 +40,9 @@ def collate_fn_base(batch):
         # Force them to integer (long) Tensors
         batched_data[key] = torch.tensor(batched_data[key], dtype=torch.long)
     return batched_data
+
+# Alias for backward compatibility
+collate_fn = collate_fn_base
 
 def init_custom_layer_weights(module):
     """

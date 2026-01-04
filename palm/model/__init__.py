@@ -5,4 +5,5 @@ from .weight_transfer import (
     detect_model_architecture,
     get_weight_mapping,
     transfer_weights_to_palm,
+    bootstrap_palm_components,
 )

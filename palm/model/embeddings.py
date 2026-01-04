@@ -8,10 +8,15 @@ class PALMEmbeddings(nn.Module):
         self.fixed_source_length = getattr(config, 'fixed_source_length', 100)
         
         # Embedding layer for word tokens
+        # Ensure padding_idx is valid (within vocab bounds) or None
+        padding_idx = getattr(config, 'pad_token_id', None)
+        if padding_idx is not None and padding_idx >= config.vocab_size:
+            padding_idx = None  # Invalid padding_idx, disable it
+        
         self.word_embeddings = nn.Embedding(
             config.vocab_size, 
             config.hidden_size, 
-            padding_idx=config.pad_token_id
+            padding_idx=padding_idx
         )
         # Embedding layer for positional information (e.g., position of each token in the sequence)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
