@@ -231,7 +231,6 @@ The source ablation evaluator can quantify this: replacing/shuffling source toke
 This is a research implementation. The architecture is complete and trainable, but:
 - Benchmarks against baselines are ongoing
 - Hyperparameter tuning (especially `sae_weight`) is task-dependent
-- Contributions and experiments welcome
 
 ## References
 
