@@ -7,7 +7,9 @@ For full evaluation, use context_rot.py after training.
 
 from dataclasses import dataclass
 from typing import Dict, Optional, List
+import time
 import torch
+from tqdm import tqdm
 
 
 @dataclass
@@ -98,11 +100,19 @@ def run_context_rot_probes(
     tokenizer,
     device: Optional[str] = None,
     max_gen_tokens: int = 32,
+    show_progress: bool = True,
 ) -> ContextRotProbeResult:
     """
     Run lightweight context rot probes (~30 seconds).
     
     Designed to run every epoch during training to catch issues early.
+    
+    Args:
+        model: The model to evaluate
+        tokenizer: Tokenizer for the model
+        device: Device to run on (defaults to model's device)
+        max_gen_tokens: Maximum tokens to generate per sample
+        show_progress: Whether to show tqdm progress bar
     
     Returns:
         ContextRotProbeResult with quick metrics
@@ -110,7 +120,11 @@ def run_context_rot_probes(
     device = device or next(model.parameters()).device
     model.eval()
     
-    def generate(prompt: str) -> str:
+    # Track generation times for diagnostics
+    gen_times = []
+    
+    def generate(prompt: str, desc: str = "") -> str:
+        start = time.time()
         inputs = tokenizer(
             prompt,
             return_tensors="pt",
@@ -128,11 +142,21 @@ def run_context_rot_probes(
                 eos_token_id=tokenizer.eos_token_id,
             )
         
+        elapsed = time.time() - start
+        gen_times.append((desc, elapsed, inputs["input_ids"].shape[1]))
+        
         generated = outputs[0][inputs["input_ids"].shape[1]:]
         return tokenizer.decode(generated, skip_special_tokens=True).strip().lower()
     
     def check_answer(response: str, expected: str) -> bool:
         return expected.lower() in response.lower()
+    
+    # Total probes: 2 focused + 2 full + 2 distractor + 2 repeated = 8
+    total_probes = 8
+    probe_iter = range(total_probes)
+    if show_progress:
+        probe_iter = tqdm(probe_iter, desc="Context Rot Probes", leave=False)
+    probe_idx = iter(probe_iter)
     
     # =========================================================================
     # Probe 1: Focused vs Full Context (2 samples)
@@ -142,17 +166,19 @@ def run_context_rot_probes(
     
     for test in QUICK_NEEDLE_TESTS:
         # Focused (just the needle)
+        next(probe_idx)  # Advance progress
         focused_prompt = f"""Context: {test["needle"]}
 
 Question: {test["question"]}
 
 Answer:"""
         
-        focused_response = generate(focused_prompt)
+        focused_response = generate(focused_prompt, "focused")
         if check_answer(focused_response, test["answer"]):
             focused_correct += 1
         
         # Full (needle buried in filler)
+        next(probe_idx)  # Advance progress
         full_context = f"{FILLER_TEXT}\n\n{test['needle']}\n\n{FILLER_TEXT}"
         full_prompt = f"""Context: {full_context}
 
@@ -160,7 +186,7 @@ Question: {test["question"]}
 
 Answer:"""
         
-        full_response = generate(full_prompt)
+        full_response = generate(full_prompt, "full_context")
         if check_answer(full_response, test["answer"]):
             full_correct += 1
     
@@ -172,6 +198,7 @@ Answer:"""
     distractor_correct = 0
     
     for i, test in enumerate(QUICK_NEEDLE_TESTS):
+        next(probe_idx)  # Advance progress
         distractor = QUICK_DISTRACTORS[i % len(QUICK_DISTRACTORS)]
         
         # Needle with distractor
@@ -183,7 +210,7 @@ Question: {test["question"]}
 
 Answer with only the specific information asked:"""
         
-        response = generate(prompt)
+        response = generate(prompt, "distractor")
         if check_answer(response, test["answer"]):
             distractor_correct += 1
     
@@ -192,7 +219,7 @@ Answer with only the specific information asked:"""
     # =========================================================================
     # Probe 3: Repeated Words (quick 2-length test)
     # =========================================================================
-    def test_repeated_words(num_words: int) -> float:
+    def test_repeated_words(num_words: int, probe_name: str) -> float:
         """Test at a specific word count."""
         common = "apple"
         modified = "apples"
@@ -209,13 +236,22 @@ Answer with only the specific information asked:"""
 Reproduced:"""
         
         # Need enough tokens
-        output = generate(prompt)
+        output = generate(prompt, probe_name)
         return _levenshtein_score(gold_text, output)
     
     # Test at short (50 words) and long (200 words)
-    repeated_short = test_repeated_words(50)
-    repeated_long = test_repeated_words(200)
+    next(probe_idx)  # Advance progress
+    repeated_short = test_repeated_words(50, "repeat_50")
+    next(probe_idx)  # Advance progress
+    repeated_long = test_repeated_words(200, "repeat_200")
     repeated_degradation = repeated_short - repeated_long
+    
+    # Log timing summary if any generations were slow
+    if gen_times and show_progress:
+        total_time = sum(t[1] for t in gen_times)
+        slowest = max(gen_times, key=lambda x: x[1])
+        if total_time > 60:  # Only warn if surprisingly slow
+            tqdm.write(f"  ⏱️ Probe timing: {total_time:.1f}s total, slowest={slowest[0]} ({slowest[1]:.1f}s, {slowest[2]} input tokens)")
     
     return ContextRotProbeResult(
         focused_correct=focused_correct,
