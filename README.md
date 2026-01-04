@@ -4,7 +4,7 @@ Large language models often show **context rot** in long generations: progressiv
 
 In standard decoder-only transformers, this degradation is driven by how attention and the residual stream become increasingly dominated by the model's own continuation, weakening effective access to the original source tokens as generation continues.
 
-**PALM** is a decoder-only architecture that preserves source connectivity throughout decoding by introducing a partial attention pathway: generated tokens can attend directly to the full source prefix at every step, while maintaining causal structure over the generated continuation. 
+**PALM** (≠ [PaLM](https://en.wikipedia.org/wiki/PaLM)) is a decoder-only architecture that preserves source connectivity throughout decoding by introducing a partial attention pathway: generated tokens can attend directly to the full source prefix at every step, while maintaining causal structure over the generated continuation. 
 
 This creates a stable channel for conditioning on retrieved documents, system constraints, and prompt instructions, improving source–target coherence and reducing attention degeneration during conditional text generation.
 
@@ -55,7 +55,7 @@ Input Tokens
 
 ```bash
 # Clone and install
-git clone https://github.com/your-username/Partial-Attention-Large-Language-Model.git
+git clone https://github.com/christianThardy/Partial-Attention-Language-Model.git
 cd Partial-Attention-Large-Language-Model
 pip install torch transformers peft bitsandbytes wandb tqdm safetensors datasets
 
