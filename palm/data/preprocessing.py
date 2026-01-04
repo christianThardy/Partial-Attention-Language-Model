@@ -13,15 +13,27 @@ def preprocess_function(examples, tokenizer, max_seq_length):
     # Tokenize combined strings, truncating or padding them to the max_seq_length
     model_inputs = tokenizer(combined, max_length=max_seq_length, truncation=True, padding="max_length")
     
+    # Calculate source lengths BEFORE converting to tensors (tokenize prompts separately)
+    source_lengths = [len(tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts]
+    
     # Convert input_ids and attention_mask to PyTorch tensors
-    model_inputs["input_ids"] = torch.tensor(model_inputs["input_ids"])
-    model_inputs["attention_mask"] = torch.tensor(model_inputs["attention_mask"])
+    input_ids = torch.tensor(model_inputs["input_ids"])
+    attention_mask = torch.tensor(model_inputs["attention_mask"])
     
-    # Create labels for training, which are identical to input_ids in this case
-    model_inputs["labels"] = torch.tensor(model_inputs["input_ids"].copy())
+    # Create labels: mask prompt tokens with -100 so loss is only computed on completions
+    # This is standard practice for instruction-tuning
+    labels = input_ids.clone()
+    for i, source_len in enumerate(source_lengths):
+        # Mask all tokens in the prompt portion (set to -100, ignored by CrossEntropyLoss)
+        labels[i, :source_len] = -100
     
-    # Calculate and store length of the prompt (source) before tokenization
-    model_inputs["source_len"] = torch.tensor([len(tokenizer.encode(prompt)) for prompt in prompts])
+    # Also mask padding tokens in labels
+    labels[attention_mask == 0] = -100
+    
+    model_inputs["input_ids"] = input_ids
+    model_inputs["attention_mask"] = attention_mask
+    model_inputs["labels"] = labels
+    model_inputs["source_len"] = torch.tensor(source_lengths)
     
     # Return processed inputs ready for model consumption
     return model_inputs

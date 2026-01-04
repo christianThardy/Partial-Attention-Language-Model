@@ -1,25 +1,238 @@
-# Partial Attention Large Language Model
+# Partial Attention Language Model (PALM)
 
-This implementation of **PALM** takes the strong foundation of decoder-only models and enhances them with the ability to better focus on what's important, remember context, and maintaining coherent, on-topic conversations.
+Large language models often show **context rot** in long generations: progressive **attention degradation** and loss of grounding on earlier context manifests as instruction drift, hallucination, "forgetting" and reduced adherence to retrieved evidence or constraints.
 
-It's essentially taking the best thing about encoder-decoder models (bidirectionality to capture rich contextual representations) and baking them directly into a decoder-only model via a partial attention mechanism 
-that alleviates attention degeneration, a bidirectional attention mask, a separate positional encoding and a specialized language embedding to help the model differentiate between source (prompt) and target 
-(generated output) text parts/sequences. PALM allows:
+In standard decoder-only transformers, this degradation is driven by how attention and the residual stream become increasingly dominated by the model’s own continuation, weakening effective access to the original source tokens as generation continues.
 
-  - **More Coherent Responses for Nuanced Tasks:**
-    - By always keeping the main topic in focus, PALM generates responses that stay more relevant to the original question or prompt.
-      
-  - **Reduced "Forgetting":**
-    - Long conversations are less likely to go off-track because the model maintains a strong connection to the initial prompt.
-      
-  - **Better Context Understanding:**
-    - The model can better differentiate between the user's input and its own responses, leading to better back-and-forth exchanges that stay on topic.
-      
-  - **Improved Long-Form Generation:**
-    - For tasks that require longer outputs, like storytelling, detailed explanations or dialogue, PALM helps maintain consistency and relevance throughout.
+PALM is a decoder-only architecture that preserves source connectivity throughout decoding by introducing a partial attention pathway: generated tokens can attend directly to the full source prefix at every step, while maintaining causal structure over the generated continuation. 
 
-<br>
+This creates a stable channel for conditioning on retrieved documents, system constraints, and prompt instructions, improving source–target coherence and reducing attention degeneration during conditional text generation.
 
-### Reference:
+## Overview
 
-Fu, Lam, Yu, Cho So, Hu, Liu,  Collier, *Decoder-Only or Encoder-Decoder? Interpreting Language Model as a Regularized Encoder-Decoder*. 2023. [<a href="https://arxiv.org/pdf/2304.04052" rel="nofollow">1</a></li>]
+PALM is an architectural wrapper around existing open-weight models (Llama, Qwen, Mistral, etc.). It transfers pretrained weights into a modified architecture that adds partial attention mechanisms while preserving the base model's learned representations.
+
+PALM enhances standard decoder-only models by introducing:
+
+- **Bidirectional attention over source tokens** - the prompt/context attends to itself fully, capturing richer contextual representations
+- **Partial attention mechanism** - a dedicated cross-attention-like module where all positions attend to the processed source embeddings
+- **Separate Positional Encoding (SPE)** - positions reset at the boundary between source and target to better delineate the two regions
+- **Language embeddings** - learned embeddings distinguish source (prompt) from target (generation)
+- **Source Auto-Encoding (SAE) auxiliary loss** - regularizes the model to reconstruct the source, encouraging faithful representations
+
+The approach is inspired by research interpreting decoder-only models as regularized encoder-decoders.
+
+## Architecture
+
+```
+Input Tokens
+     │
+     ▼
+┌─────────────────────────────────────┐
+│  PALMEmbeddings                     │
+│  word + position + language         │
+└─────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────┐
+│  PALMLayer (×N)                     │
+│  ├── Self-Attention (bidirectional  │
+│  │   for source, causal for target) │
+│  ├── Partial Attention (all tokens  │
+│  │   attend to transformed source)  │
+│  └── Feed-Forward Network           │
+└─────────────────────────────────────┘
+     │
+     ├─────────────────┐
+     ▼                 ▼
+┌──────────┐    ┌──────────┐
+│ LM Head  │    │ SAE Head │
+│ (target) │    │ (source) │
+└──────────┘    └──────────┘
+```
+
+## Start training in 10 Minutes
+
+```bash
+# Clone and install
+git clone https://github.com/your-username/Partial-Attention-Large-Language-Model.git
+cd Partial-Attention-Large-Language-Model
+pip install torch transformers peft bitsandbytes wandb tqdm safetensors datasets
+
+# Run the training notebook
+jupyter notebook notebooks/finetune_palm.ipynb
+```
+
+The notebook walks through:
+1. Loading a base model (Llama/Qwen/etc.) and transferring weights to PALM
+2. Fine-tuning on a QA dataset with LoRA
+3. Evaluating generation quality and source faithfulness
+
+**Lower VRAM?** Use QLoRA (8GB+) or reduce batch size. See the notebook for configuration.
+
+## Quick Start
+
+```python
+from palm import PALMConfig, PALMModel, transfer_weights_to_palm
+
+# Initialize configuration (inherits from any HuggingFace model)
+config = PALMConfig(
+    base_model_name="meta-llama/Llama-3.2-3B",
+    fixed_source_length=128,
+    sae_weight=0.5,
+)
+
+# Create model and transfer pretrained weights
+model = PALMModel(config)
+model = transfer_weights_to_palm(model, config.base_model_name)
+
+# Forward pass with source/target distinction
+outputs = model(
+    input_ids=input_ids,
+    attention_mask=attention_mask,
+    labels=labels,
+    source_len=source_lengths,  # per-sample source lengths
+)
+lm_logits, combined_loss, lm_loss, sae_loss = outputs
+```
+
+## Features
+
+### Weight Transfer
+
+PALM doesn't train from scratch, it bootstraps from any compatible open-weight model:
+
+```python
+from palm import PALMModel, PALMConfig, transfer_weights_to_palm
+
+# Supports: Llama, Qwen, Mistral, Phi, Gemma, Falcon
+model = PALMModel(PALMConfig(base_model_name="Qwen/Qwen2.5-3B"))
+model = transfer_weights_to_palm(model, "Qwen/Qwen2.5-3B")
+```
+
+**What transfers:** Self-attention projections (Q/K/V/O), MLP weights, embeddings, LM head; the bulk of the model.
+
+**What's fresh:** Partial attention layers, SAE head, language embeddings, Fp transformation; the PALM-specific additions that get trained.
+
+### LoRA / QLoRA Fine-tuning
+
+```python
+from palm import apply_lora, apply_qlora
+
+# Standard LoRA
+model = apply_lora(model, r=16, lora_alpha=32)
+
+# Quantized LoRA for memory efficiency
+model = apply_qlora(model, r=16, lora_alpha=32)
+```
+
+Targets all attention projections in both self-attention and partial attention modules.
+
+### Training
+
+```python
+from palm import PALMTrainer
+
+trainer = PALMTrainer(
+    model=model,
+    train_dataloader=train_loader,
+    eval_dataloader=eval_loader,
+    config=config,
+)
+trainer.train()
+```
+
+Includes gradient accumulation, learning rate scheduling, and WandB integration.
+
+### Generation with KV Caching
+
+```python
+generated = model.generate(
+    input_ids=prompt_ids,
+    max_length=256,
+    temperature=0.7,
+    top_p=0.9,
+    use_cache=True,  # KV caching for efficient autoregressive generation
+)
+```
+
+### Evaluation Suite
+
+```python
+from palm.evaluation import (
+    StaggeredEvaluator,
+    CheckpointScoreboard,
+    LambdaSweepRunner,
+    SourceAblationEvaluator,
+)
+
+# Lightweight evaluation during training
+evaluator = StaggeredEvaluator(model, tokenizer)
+results = evaluator.evaluate(eval_samples)
+
+# Hyperparameter analysis
+sweep = LambdaSweepRunner(config, lambda_values=[0.1, 0.3, 0.5, 0.7, 1.0])
+sweep_results = sweep.run(train_loader, eval_loader)
+
+# Source ablation to test sensitivity to prompt
+ablation = SourceAblationEvaluator(model, tokenizer)
+ablation_results = ablation.evaluate(samples)
+```
+
+---
+
+## Key Concepts
+
+### Bidirectional Source Attention
+
+The attention mask allows source tokens to attend to each other bidirectionally (like an encoder), while target tokens attend causally to previous tokens and fully to all source tokens.
+
+### Partial Attention
+
+Each layer applies an additional attention operation where query vectors from the full sequence attend to key/value vectors derived solely from the source portion, processed through a learned transformation (Fp network). This maintains a persistent connection to the original prompt throughout generation.
+
+### Source Auto-Encoding Loss
+
+The SAE head predicts the source tokens from their hidden representations, acting as a regularizer:
+
+```
+combined_loss = lm_loss + λ * sae_loss
+```
+
+The `sae_weight` (λ) hyperparameter controls the strength of this regularization.
+
+## Configuration
+
+Key configuration parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `base_model_name` | `meta-llama/Meta-Llama-3.1-8B-Instruct` | HuggingFace model to inherit config from |
+| `fixed_source_length` | 100 | Default source sequence length |
+| `sae_weight` | 0.5 | Weight for SAE loss in combined loss |
+| `hidden_size` | 4096 | Hidden dimension |
+| `num_hidden_layers` | 32 | Number of transformer layers |
+| `num_attention_heads` | 32 | Number of attention heads |
+| `learning_rate` | 5e-5 | Optimizer learning rate |
+| `gradient_accumulation_steps` | 10 | Steps before optimizer update |
+
+## What to Expect
+
+After training, you should see:
+
+- Combined loss decreasing (LM loss + SAE loss)
+- SAE loss staying low, indicating the model maintains source representations
+- If PALM is using the source, source ablation should measurably reduce output likelihood/quality vs baseline.
+
+The source ablation evaluator can quantify this: replacing/shuffling source tokens should significantly degrade output quality if the partial attention mechanism is working.
+
+## Status
+
+This is a research implementation. The architecture is complete and trainable, but:
+- Benchmarks against baselines are ongoing
+- Hyperparameter tuning (especially `sae_weight`) is task-dependent
+- Contributions and experiments welcome
+
+## References
+
+Fu, Lam, Yu, Cho So, Hu, Liu, Collier. *Decoder-Only or Encoder-Decoder? Interpreting Language Model as a Regularized Encoder-Decoder*. 2023. [[arXiv]](https://arxiv.org/pdf/2304.04052)

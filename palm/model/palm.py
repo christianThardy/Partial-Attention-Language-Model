@@ -2,27 +2,30 @@
 import os
 import logging
 
-from attention import PALMAttention, PALMPartialAttention
-from embeddings import PALMEmbeddings
+from .attention import PALMAttention, PALMPartialAttention
+from .embeddings import PALMEmbeddings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from safetensors.torch import save_file as safe_save_file
+from transformers import GenerationConfig
 
 import glob
 
 # Logger object
-logger = logging.getLogger()
-# Set the level of the logger. Possible values: DEBUG, INFO, WARNING, ERROR, CRITICAL
-logger.setLevel(logging.DEBUG)
-# Handler that writes log messages to the notebook's output
-handler = logging.StreamHandler()
-# Set the format for the log messages
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-# Add the handler to the logger
-logger.addHandler(handler)
+logger = logging.getLogger(__name__)
+# # Set the level of the logger. Possible values: DEBUG, INFO, WARNING, ERROR, CRITICAL
+# logger.setLevel(logging.DEBUG)
+# # Handler that writes log messages to the notebook's output
+# handler = logging.StreamHandler()
+# # Set the format for the log messages
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# handler.setFormatter(formatter)
+# # Add the handler to the logger
+# logger.addHandler(handler)
+logger.setLevel(logging.WARNING)  # Changed from DEBUG to reduce overhead during training
 
 
 class PALMIntermediate(nn.Module):
@@ -80,28 +83,72 @@ class PALMLayer(nn.Module):
         # Output layer to produce the final output for this layer
         self.output = PALMOutput(config)
 
-    def forward(self, hidden_states, attention_mask=None):
-        # Apply attention mechanism
-        attention_output = self.attention(hidden_states, attention_mask)
-
-        # Apply partial attention using a subset of the hidden states
-        partial_attention_output = self.partial_attention(
-            attention_output,
-            hidden_states[:, :self.config.fixed_source_length],
-            attention_mask
+    def forward(self, hidden_states, attention_mask=None, source_hidden_states=None,
+                past_key_value=None, use_cache=False):
+        """
+        Args:
+            hidden_states: Input tensor
+            attention_mask: Attention mask in additive form
+            source_hidden_states: Source states for partial attention
+            past_key_value: Tuple of ((attn_key, attn_value), (partial_key, partial_value))
+            use_cache: Whether to return key/values for caching
+        
+        Returns:
+            layer_output: Output tensor
+            present_key_value: Tuple of caches if use_cache=True, else None
+        """
+        # Unpack past key values if provided
+        past_attn_kv = None
+        past_partial_kv = None
+        if past_key_value is not None:
+            past_attn_kv, past_partial_kv = past_key_value
+        
+        # Apply attention mechanism with caching
+        attention_output, present_attn_kv = self.attention(
+            hidden_states, attention_mask, 
+            past_key_value=past_attn_kv, use_cache=use_cache
         )
+
+        # Apply partial attention using source hidden states
+        # For incremental decoding with cache, source_hidden_states is None because K/V are cached
+        if source_hidden_states is None and past_partial_kv is None:
+            # Fallback: extract from hidden_states if possible
+            source_hidden_states = hidden_states[:, :self.config.fixed_source_length]
+        
+        partial_attention_output, present_partial_kv = self.partial_attention(
+            attention_output,
+            source_hidden_states,  # Can be None if past_partial_kv is provided
+            attention_mask,
+            past_key_value=past_partial_kv,
+            use_cache=use_cache
+        )
+        
+        # Pack present key values
+        present_key_value = None
+        if use_cache:
+            present_key_value = (present_attn_kv, present_partial_kv)
+        
         # Process output of the partial attention with the intermediate layer
         intermediate_output = self.intermediate(partial_attention_output)
 
         # Apply output layer to produce the final output for this layer
         layer_output = self.output(intermediate_output, partial_attention_output)
-        return layer_output
+        return layer_output, present_key_value
     
 
 class PALMModel(nn.Module):
+    # HuggingFace/PEFT compatibility attributes
+    _supports_cache_class = False
+    supports_gradient_checkpointing = True
+    _supports_sdpa = False
+    _supports_flash_attn_2 = False
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
+        
+        # Gradient checkpointing for memory efficiency
+        self.gradient_checkpointing = getattr(config, 'gradient_checkpointing', False)
 
         # Embedding layer for input tokens
         self.embeddings = PALMEmbeddings(config)
@@ -117,76 +164,233 @@ class PALMModel(nn.Module):
         
         # Weight for combining SAE loss
         self.sae_weight = config.sae_weight if hasattr(config, 'sae_weight') else 0.5  # Weight for SAE loss
+        
+        # Generation config for PEFT/HuggingFace compatibility
+        # This is required when PEFT wraps the model for generation
+        self.generation_config = GenerationConfig(
+            max_length=getattr(config, 'max_length', 512),
+            max_new_tokens=None,
+            min_length=getattr(config, 'min_length', 1),
+            do_sample=True,
+            temperature=1.0,
+            top_k=50,
+            top_p=1.0,
+            repetition_penalty=1.0,
+            pad_token_id=getattr(config, 'pad_token_id', None),
+            eos_token_id=getattr(config, 'eos_token_id', None),
+            bos_token_id=getattr(config, 'bos_token_id', None),
+        )
 
-    def create_bidirectional_attention_mask(self, input_ids):
-        seq_length = input_ids.size(1)
-        batch_size = input_ids.size(0)
-    
-        # Create a mask for bidirectional attention on the source sequence and causal attention on the target
-        mask = torch.zeros((batch_size, 1, seq_length, seq_length), device=input_ids.device)
-    
-        # Define length of the source sequence (minimum of seq_length and fixed_source_length)
-        actual_source_length = min(seq_length, self.config.fixed_source_length)
-    
-        # Apply bidirectional attention to the source sequence
-        mask[:, :, :actual_source_length, :actual_source_length] = 1
-    
-        # If sequence is longer than source length, add causal mask for the target sequence
-        # Apply causal attention to the target sequence
-        if seq_length > actual_source_length:
-            causal_mask = torch.tril(torch.ones((seq_length - actual_source_length, seq_length - actual_source_length), device=input_ids.device))
-            mask[:, :, actual_source_length:, actual_source_length:] = causal_mask
-    
-        # Allow target sequence to attend to all of source sequence
-        mask[:, :, actual_source_length:, :actual_source_length] = 1
-    
-        # Convert the mask to a form suitable for additive attention
-        # So convert 0s to -10000.0 and 1s to 0.0
+    def create_bidirectional_attention_mask(self, input_ids, source_len=None):
+        """
+        Create attention mask with per-sample source lengths.
+        
+        Args:
+            input_ids: [batch_size, seq_length]
+            source_len: tensor of shape [batch_size] with per-sample source lengths,
+                       OR an integer for uniform source length across batch,
+                       OR None to use config.fixed_source_length
+        
+        Returns:
+            mask: [batch_size, 1, seq_length, seq_length] in additive form
+                  (0 = attend, -10000 = mask)
+        
+        Mask structure per sample:
+            - Source tokens (0 to source_len-1): bidirectional attention
+            - Target tokens (source_len to end): causal attention + can attend to all source
+        """
+        batch_size, seq_length = input_ids.size()
+        device = input_ids.device
+        
+        # Handle source_len argument
+        if source_len is None:
+            source_len = self.config.fixed_source_length
+        
+        # Convert source_len to tensor if it's an integer
+        if isinstance(source_len, int):
+            source_len = torch.full((batch_size,), source_len, dtype=torch.long, device=device)
+        else:
+            source_len = source_len.to(device)
+            # Clamp source_len to not exceed seq_length
+            source_len = torch.clamp(source_len, max=seq_length)
+        
+        # Create position indices [1, seq_length]
+        pos = torch.arange(seq_length, device=device).unsqueeze(0)
+        
+        # Expand source_len to [batch_size, 1] for broadcasting
+        source_len_expanded = source_len.unsqueeze(1)
+        
+        # Create masks for source and target regions
+        # is_source[b, i] = True if position i is in source region for sample b
+        is_source = pos < source_len_expanded  # [batch_size, seq_length]
+        
+        # Create causal mask
+        causal = torch.tril(torch.ones((seq_length, seq_length), device=device, dtype=torch.bool))
+        causal = causal.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Build attention pattern
+        is_source_query = is_source.unsqueeze(2)  # [batch_size, seq_length, 1]
+        is_source_key = is_source.unsqueeze(1)    # [batch_size, 1, seq_length]
+        
+        # Source tokens can attend to all source tokens (bidirectional)
+        source_to_source = is_source_query & is_source_key
+        
+        # Target tokens can attend to source tokens
+        is_target_query = ~is_source_query
+        target_to_source = is_target_query & is_source_key
+        
+        # Target tokens use causal attention for target-to-target
+        target_to_target = is_target_query & (~is_source_key) & causal
+        
+        # Combine all attention patterns
+        attend_mask = source_to_source | target_to_source | target_to_target
+        
+        # Convert to additive mask format
+        mask = attend_mask.unsqueeze(1).float()
         mask = (1.0 - mask) * -10000.0
-    
+        
         return mask
 
-    def forward(self, input_ids, attention_mask=None, labels=None, source_len=None):
+    def forward(self, input_ids=None, attention_mask=None, labels=None, source_len=None,
+                past_key_values=None, use_cache=False, position_offset=None,
+                inputs_embeds=None, output_attentions=None, output_hidden_states=None,
+                return_dict=None, **kwargs):
+        """
+        Args:
+            input_ids: Input token IDs [batch_size, seq_length]
+            attention_mask: Attention mask (2D padding or 4D full mask)
+            labels: Labels for loss computation
+            source_len: Per-sample source lengths [batch_size] for mask creation and SAE loss
+            past_key_values: List of past key/value tuples for each layer
+            use_cache: Whether to return key/values for caching
+            position_offset: Position offset for incremental decoding (for embeddings)
+            inputs_embeds: Pre-computed embeddings (alternative to input_ids, used by PEFT)
+            output_attentions: Not used, for HuggingFace compatibility
+            output_hidden_states: Not used, for HuggingFace compatibility
+            return_dict: Not used, for HuggingFace compatibility
+            **kwargs: Additional arguments for compatibility
+        
+        Returns:
+            lm_logits, combined_loss, loss, sae_loss[, past_key_values]
+        """
         try:
-            # Ensure input_ids is a tensor and has the correct dimensions
-            input_ids = torch.tensor(input_ids) if not isinstance(input_ids, torch.Tensor) else input_ids
-            if input_ids.dim() == 1:
-                input_ids = input_ids.unsqueeze(0)  # Add batch dimension
-            
-            # Create or validate attention mask
-            if attention_mask is None:
-                attention_mask = self.create_bidirectional_attention_mask(input_ids)
+            # Handle inputs_embeds (used by PEFT) or input_ids
+            if inputs_embeds is not None:
+                batch_size, seq_length, _ = inputs_embeds.shape
+                device = inputs_embeds.device
+                # If input_ids not provided but we need them for labels/SAE, this will fail gracefully
+                if input_ids is None:
+                    input_ids = torch.zeros((batch_size, seq_length), dtype=torch.long, device=device)
             else:
+                # Ensure input_ids is a tensor and has the correct dimensions
+                input_ids = torch.tensor(input_ids) if not isinstance(input_ids, torch.Tensor) else input_ids
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                batch_size, seq_length = input_ids.shape
+                device = input_ids.device
+            
+            # Track if source_len was explicitly provided (for SAE loss computation)
+            source_len_provided = source_len is not None
+            
+            # Handle source_len - default to fixed_source_length if not provided
+            # (needed for attention mask creation, but SAE loss only computed if explicitly provided)
+            if source_len is None:
+                source_len = torch.full(
+                    (batch_size,), 
+                    min(self.config.fixed_source_length, seq_length),
+                    dtype=torch.long, 
+                    device=device
+                )
+            elif isinstance(source_len, int):
+                source_len = torch.full((batch_size,), source_len, dtype=torch.long, device=device)
+            else:
+                source_len = source_len.to(device)
+            
+            # Determine position offset for embeddings
+            if position_offset is None:
+                position_offset = 0
+            
+            # Handle attention mask
+            padding_mask = None
+            if attention_mask is not None:
                 attention_mask = torch.tensor(attention_mask) if not isinstance(attention_mask, torch.Tensor) else attention_mask
                 if attention_mask.dim() == 1:
-                    attention_mask = attention_mask.unsqueeze(0)  # Add batch dimension
+                    attention_mask = attention_mask.unsqueeze(0)
+                if attention_mask.dim() == 2:
+                    padding_mask = attention_mask
+                    attention_mask = None
+            
+            # Create the bidirectional attention mask with per-sample source_len
+            if attention_mask is None:
+                attention_mask = self.create_bidirectional_attention_mask(input_ids, source_len)
+                
+                if padding_mask is not None:
+                    expanded_padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
+                    padding_mask_additive = (1.0 - expanded_padding_mask.float()) * -10000.0
+                    attention_mask = attention_mask + padding_mask_additive
     
             # Ensure labels are tensors and have the correct dimensions
             if labels is not None:
                 labels = torch.tensor(labels) if not isinstance(labels, torch.Tensor) else labels
                 if labels.dim() == 1:
-                    labels = labels.unsqueeze(0)  # Add batch dimension
+                    labels = labels.unsqueeze(0)
     
-            # Embedding lookup
-            #print("Forward pass: Starting embeddings")
-            hidden_states = self.embeddings(input_ids)
-            #print("Forward pass: Embeddings complete")
+            # Embedding lookup with position offset (or use pre-computed inputs_embeds)
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embeddings(input_ids, position_offset=position_offset)
+            
+            # For first forward pass (no cache), get source hidden states
+            # For incremental decoding, source K/V is already cached in partial attention
+            if past_key_values is None:
+                # Use max source_len for source_hidden_states extraction
+                max_source_len = min(source_len.max().item(), seq_length)
+                source_hidden_states = hidden_states[:, :int(max_source_len)]
+            else:
+                # Incremental: source states not needed as K/V are cached
+                source_hidden_states = None
     
-            # Pass through each layer
-            for layer in self.layers:
-                #print(f"Forward pass: Starting layer {layer}")
-                hidden_states = layer(hidden_states, attention_mask)
-                #print(f"Forward pass: Layer {layer} complete")
+            # Initialize present key values list
+            present_key_values = [] if use_cache else None
+    
+            # Pass through each layer with caching
+            for i, layer in enumerate(self.layers):
+                layer_past_kv = past_key_values[i] if past_key_values is not None else None
+                
+                # Use gradient checkpointing if enabled and training (saves memory)
+                if self.gradient_checkpointing and self.training and not use_cache:
+                    # Gradient checkpointing wrapper - recomputes activations during backward
+                    def create_custom_forward(module):
+                        def custom_forward(hidden_states, attention_mask, source_hidden_states):
+                            outputs = module(hidden_states, attention_mask, 
+                                           source_hidden_states=source_hidden_states,
+                                           past_key_value=None, use_cache=False)
+                            return outputs[0]  # Only return hidden_states
+                        return custom_forward
+                    
+                    hidden_states = gradient_checkpoint(
+                        create_custom_forward(layer),
+                        hidden_states,
+                        attention_mask,
+                        source_hidden_states,
+                        use_reentrant=False
+                    )
+                    present_kv = None
+                else:
+                    hidden_states, present_kv = layer(
+                        hidden_states, 
+                        attention_mask,
+                        source_hidden_states=source_hidden_states,
+                        past_key_value=layer_past_kv,
+                        use_cache=use_cache
+                    )
+                
+                if use_cache:
+                    present_key_values.append(present_kv)
     
             # Compute logits for language modeling
-            #print("Forward pass: Starting lm_head")
             lm_logits = self.lm_head(hidden_states)
-            #print("Forward pass: lm_head complete")
-
-            # Compute logits for sequence autoencoding
-            #print("Forward pass: Starting sae_head")
-            sae_logits = self.sae_head(hidden_states[:, :self.config.fixed_source_length])
-            #print("Forward pass: sae_head complete")
 
             # Initialize loss variables
             loss = None
@@ -195,18 +399,37 @@ class PALMModel(nn.Module):
             
             # Compute loss if labels are provided
             if labels is not None:
-                loss_fct = nn.CrossEntropyLoss()
+                # Use ignore_index=-100 to exclude masked tokens (prompt + padding) from loss
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                 loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
-                #print(f"Forward pass: Loss calculated: {loss.item()}")
 
-                # Calculate SAE loss if source length is provided
-                if source_len is not None:
-                    sae_labels = input_ids[:, :self.config.fixed_source_length]
-                    sae_loss = loss_fct(sae_logits.view(-1, self.config.vocab_size), sae_labels.reshape(-1))
-
-                # Combine losses
-                combined_loss = loss + self.sae_weight * sae_loss
-                
+                # Calculate SAE loss only if source_len was explicitly provided
+                if source_len_provided:
+                    # Compute SAE logits only for source portion
+                    max_source_len = min(source_len.max().item(), hidden_states.size(1))
+                    max_source_len = int(max_source_len)
+                    
+                    sae_logits = self.sae_head(hidden_states[:, :max_source_len])
+                    sae_labels = input_ids[:, :max_source_len].clone()
+                    
+                    # Mask out positions beyond each sample's actual source_len with -100
+                    # Vectorized version for efficiency
+                    range_tensor = torch.arange(max_source_len, device=device).unsqueeze(0)
+                    source_mask = range_tensor >= source_len.unsqueeze(1)
+                    sae_labels[source_mask] = -100
+                    
+                    sae_loss = loss_fct(sae_logits.view(-1, self.config.vocab_size), sae_labels.view(-1))
+                    
+                    # Combine losses
+                    combined_loss = loss + self.sae_weight * sae_loss
+                else:
+                    # No SAE loss if source_len not provided (backward compatibility)
+                    combined_loss = loss
+                    sae_loss = torch.tensor(0.0, device=loss.device)
+            
+            # Return with or without cache
+            if use_cache:
+                return lm_logits, combined_loss, loss, sae_loss, present_key_values
             return lm_logits, combined_loss, loss, sae_loss   
     
         except Exception as e:
@@ -216,10 +439,19 @@ class PALMModel(nn.Module):
                   f"labels: {labels.shape if isinstance(labels, torch.Tensor) else 'not a tensor'},")
             raise
 
-    def generate(self, input_ids, max_length=None, min_length=None, do_sample=True, temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0, pad_token_id=None, eos_token_id=None, attention_mask=None, **kwargs):
+    def generate(self, input_ids, max_length=None, min_length=None, do_sample=True, 
+                 temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0, 
+                 pad_token_id=None, eos_token_id=None, attention_mask=None, 
+                 use_cache=True, **kwargs):
+        """
+        Generate text with optional KV caching for faster inference.
+        
+        Args:
+            use_cache: If True, use KV caching for faster generation (default: True)
+        """
         # Set default values for generation parameters
-        max_length = max_length if max_length is not None else self.config.max_length
-        min_length = min_length if min_length is not None else self.config.min_length
+        max_length = max_length if max_length is not None else getattr(self.config, 'max_length', 512)
+        min_length = min_length if min_length is not None else getattr(self.config, 'min_length', 1)
         pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
 
@@ -227,72 +459,137 @@ class PALMModel(nn.Module):
         device = next(self.parameters()).device
         input_ids = input_ids.to(device)
 
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = self.create_bidirectional_attention_mask(input_ids)
+        # IMPORTANT: Store the original source length (the prompt length)
+        original_source_length = input_ids.shape[1]
         
-        # Initialize sequence tracking and keep track of which sequences are already finished
+        # Temporarily override fixed_source_length for this generation
+        saved_fixed_source_length = self.config.fixed_source_length
+        self.config.fixed_source_length = original_source_length
+        
+        # Initialize sequence tracking
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
-        
-        # Initialize generated sequence with the input sequence
         generated_sequence = input_ids
+        past_key_values = None
 
-        while True:
-            # Prepare model inputs
-            model_inputs = {
-                "input_ids": generated_sequence,
-                "attention_mask": attention_mask,
-            }
+        try:
+            while True:
+                # Determine what to pass to forward
+                if use_cache and past_key_values is not None:
+                    # Only pass the last token when using cache
+                    model_input_ids = generated_sequence[:, -1:]
+                    # Position offset is the position of the new token
+                    position_offset = generated_sequence.shape[1] - 1
+                    # Create attention mask for single new token attending to full sequence
+                    full_seq_len = generated_sequence.shape[1]
+                    attention_mask = self._create_incremental_attention_mask(
+                        full_seq_len, original_source_length, device
+                    )
+                else:
+                    # First step or no caching: pass full sequence
+                    model_input_ids = generated_sequence
+                    position_offset = 0
+                    attention_mask = self.create_bidirectional_attention_mask(generated_sequence)
 
-            # Forward pass without gradients
-            with torch.no_grad():
-                outputs = self(**model_inputs)
-            
-            # Get the next token logits
-            next_token_logits = outputs[0][:, -1, :]
+                # Forward pass without gradients
+                with torch.no_grad():
+                    outputs = self(
+                        model_input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        position_offset=position_offset
+                    )
+                
+                # Get logits and optionally update cache
+                if use_cache:
+                    lm_logits, _, _, _, past_key_values = outputs
+                else:
+                    lm_logits = outputs[0]
+                
+                # Get the next token logits (last position)
+                next_token_logits = lm_logits[:, -1, :]
 
-            # Adjust logits for generation
-            next_token_logits = self.adjust_logits_during_generation(
-                next_token_logits,
-                cur_len=generated_sequence.shape[1],
-                max_length=max_length,
-                min_length=min_length,
-                repetition_penalty=repetition_penalty,
-                input_ids=generated_sequence
-            )
+                # Adjust logits for generation
+                next_token_logits = self.adjust_logits_during_generation(
+                    next_token_logits,
+                    cur_len=generated_sequence.shape[1],
+                    max_length=max_length,
+                    min_length=min_length,
+                    repetition_penalty=repetition_penalty,
+                    input_ids=generated_sequence
+                )
 
-            # Apply temperature
-            next_token_logits = next_token_logits / temperature
+                # Apply temperature
+                next_token_logits = next_token_logits / temperature
 
-            # Apply top-k and top-p filtering
-            next_token_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+                # Apply top-k and top-p filtering
+                next_token_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
 
-            # Sample next token
-            if do_sample:
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_logits, dim=-1)
+                # Sample next token
+                if do_sample:
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(next_token_logits, dim=-1)
 
-            # Handle finished sequences
-            # Finished sentences should have their next token be a padding token
-            next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+                # Handle finished sequences
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
-            # Update unfinished sequences
-            unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
+                # Update unfinished sequences
+                unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
 
-            # Append next tokens to the sequence
-            generated_sequence = torch.cat([generated_sequence, next_tokens.unsqueeze(-1)], dim=-1)
+                # Append next tokens to the sequence
+                generated_sequence = torch.cat([generated_sequence, next_tokens.unsqueeze(-1)], dim=-1)
 
-            # Update attention mask
-            new_attention_mask = self.create_bidirectional_attention_mask(generated_sequence)
-            attention_mask = new_attention_mask
-
-            # Stop if we've reached max_length or all sequences are finished
-            if unfinished_sequences.max() == 0 or generated_sequence.shape[1] >= max_length:
-                break
+                # Stop if we've reached max_length or all sequences are finished
+                if unfinished_sequences.max() == 0 or generated_sequence.shape[1] >= max_length:
+                    break
+        finally:
+            # Restore original fixed_source_length
+            self.config.fixed_source_length = saved_fixed_source_length
 
         return generated_sequence
+    
+    def _create_incremental_attention_mask(self, full_seq_len, source_length, device):
+        """
+        Create attention mask for a single new token attending to the full sequence.
+        
+        For incremental decoding, the new token can attend to:
+        - All source tokens (bidirectionally)
+        - All previous target tokens (causally - but they're all in the past)
+        - Itself
+        
+        Returns:
+            Attention mask of shape [1, 1, 1, full_seq_len] (0 = attend, -10000 = mask)
+        """
+        # The new token can attend to everything before it (including all source and generated tokens)
+        # So the mask is all zeros (attend to everything)
+        mask = torch.zeros((1, 1, 1, full_seq_len), device=device)
+        return mask
+    
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
+        """
+        Prepare inputs for generation (required by PEFT/HuggingFace generation utilities).
+        
+        Args:
+            input_ids: Input token IDs [batch_size, seq_length]
+            past_key_values: Cached key/values from previous forward pass
+            attention_mask: Optional attention mask
+            **kwargs: Additional arguments (position_offset, use_cache, etc.)
+        
+        Returns:
+            Dictionary with model inputs
+        """
+        # If past_key_values exist, only use the last token
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": kwargs.get("use_cache", True),
+        }
     
     def adjust_logits_during_generation(self, logits, cur_len, max_length, min_length, repetition_penalty, input_ids):
         """Adjust token logits during generation."""

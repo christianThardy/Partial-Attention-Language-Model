@@ -23,49 +23,61 @@ class PALMEmbeddings(nn.Module):
         # Fixed length for source sequence; used to distinguish between source and target positions
         self.fixed_source_length = config.fixed_source_length
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, position_offset=0):
+        """
+        Args:
+            input_ids: Token IDs
+            position_offset: Offset to add to position IDs (for incremental decoding)
+        """
         if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)  # Add batch dimension if input is a single sequence
+            input_ids = input_ids.unsqueeze(0)
         
-        seq_length = input_ids.size(1) # Get sequence length of the input
+        seq_length = input_ids.size(1)
         
         # Separate Positional Encoding (SPE)
-        # Generate position IDs ranging from 0 to seq_length-1
-        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
+        # Generate position IDs ranging from 0 to seq_length-1, plus offset
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device) + position_offset
         
-        # Adjust position_ids if sequence length exceeds the fixed source length
-        if seq_length > self.fixed_source_length:
-            position_ids[self.fixed_source_length:] = torch.arange(
-                seq_length - self.fixed_source_length, 
+        # Adjust position_ids if positions exceed the fixed source length
+        # For target positions, reset to start from 0
+        if position_offset < self.fixed_source_length:
+            # Some positions may be source, some may be target
+            target_start = max(0, self.fixed_source_length - position_offset)
+            if target_start < seq_length:
+                # Positions beyond source_length get reset for SPE
+                position_ids[target_start:] = torch.arange(
+                    seq_length - target_start, 
+                    dtype=torch.long, 
+                    device=input_ids.device
+                )
+        else:
+            # All positions are target positions
+            position_ids = torch.arange(
+                position_offset - self.fixed_source_length,
+                position_offset - self.fixed_source_length + seq_length,
                 dtype=torch.long, 
                 device=input_ids.device
             )
         
         # Language IDs: 0 for source, 1 for target
-        # Initialize language IDs to 0 (source language)
         language_ids = torch.zeros_like(input_ids)
+        
+        # Determine which positions are target based on absolute position
+        for i in range(seq_length):
+            if position_offset + i >= self.fixed_source_length:
+                language_ids[:, i] = 1
 
-        # Set language IDs to 1 (target language) for positions beyond the fixed source length
-        if seq_length > self.fixed_source_length:
-            language_ids[:, self.fixed_source_length:] = 1
-
-        # Get embeddings for the input word tokens
+        # Get embeddings
         word_embeddings = self.word_embeddings(input_ids)
-
-        # Get embeddings for the positions
         position_embeddings = self.position_embeddings(position_ids)
-
-        # Get embeddings for the language (source/target)
         language_embeddings = self.language_embeddings(language_ids)
 
-        # Sum word, position, and language embeddings to form the final embedding representation
+        # Sum embeddings
         embeddings = word_embeddings + position_embeddings + language_embeddings
         
-        # Apply layer normalization to the combined embeddings
+        # Apply layer normalization and dropout
         embeddings = self.LayerNorm(embeddings)
-
-        # Apply dropout for regularization
         embeddings = self.dropout(embeddings)
 
-        return embeddings # Final embedding tensor
+        return embeddings
     

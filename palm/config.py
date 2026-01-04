@@ -25,6 +25,17 @@ class PALMConfig(PretrainedConfig):
         pad_token_id=128257, # Token ID used for padding sequences
         bos_token_id=1, # Token ID for the beginning of a sequence
         eos_token_id=2, # Token ID for the end of a sequence
+        # Training hyperparameters
+        learning_rate=5e-5, # Learning rate for optimizer
+        warmup_steps=50, # Number of warmup steps for learning rate scheduler
+        num_train_epochs=70, # Number of training epochs
+        gradient_accumulation_steps=10, # Steps for gradient accumulation
+        train_batch_size=64, # Training batch size
+        logging_steps=100, # Log metrics every N steps
+        sae_weight=0.5, # Weight for SAE loss in combined loss
+        max_length=512, # Max generation length
+        min_length=1, # Min generation length
+        gradient_checkpointing=False, # Whether to use gradient checkpointing
         **kwargs
     ):
         # Call the parent class (PretrainedConfig) constructor with specific token IDs
@@ -48,6 +59,17 @@ class PALMConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
+        # Training hyperparameters
+        self.learning_rate = learning_rate
+        self.warmup_steps = warmup_steps
+        self.num_train_epochs = num_train_epochs
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.train_batch_size = train_batch_size
+        self.logging_steps = logging_steps
+        self.sae_weight = sae_weight
+        self.max_length = max_length
+        self.min_length = min_length
+        self.gradient_checkpointing = gradient_checkpointing
 
         # Load base model config
         base_config = AutoConfig.from_pretrained(base_model_name)

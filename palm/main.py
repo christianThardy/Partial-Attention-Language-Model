@@ -1,7 +1,6 @@
 import torch
 
 from transformers import AutoTokenizer
-from datasets import load_dataset
 
 from palm.constants import *
 from palm.config import PALMConfig
@@ -19,13 +18,10 @@ def main():
     wandb.init(project="palm-instruction-tuning", name="palm-llama-3-8b-instruction")
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, device_map='auto')
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
-    # Load dataset
-    dataset = load_dataset(DATASET_NAME)
-
-    # Create config
+    # Create config with training hyperparameters from constants
     config = PALMConfig(
         base_model_name=MODEL_NAME, 
         hidden_dropout_prob=0.3, 
@@ -33,14 +29,24 @@ def main():
         num_hidden_layers=10, 
         num_attention_heads=10, 
         hidden_size=750, 
-        layer_norm_eps=1e-5
+        layer_norm_eps=1e-5,
+        # Training hyperparameters from constants
+        learning_rate=LEARNING_RATE,
+        warmup_steps=WARMUP_STEPS,
+        num_train_epochs=NUM_TRAIN_EPOCHS,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        train_batch_size=TRAIN_BATCH_SIZE,
+        max_length=MAX_SEQ_LENGTH,
+        # Sync pad_token_id with tokenizer
+        pad_token_id=tokenizer.pad_token_id,
+        vocab_size=len(tokenizer),
     )
 
     # Create model
     model = PALMModel(config)
 
-    # Preprocess and split dataset
-    train_dataset, eval_dataset = load_and_split_dataset(dataset, TRAIN_RATIO)
+    # Preprocess and split dataset (pass dataset name, not dataset object)
+    train_dataset, eval_dataset = load_and_split_dataset(DATASET_NAME, TRAIN_RATIO)
     
     train_dataset = train_dataset.map(
         lambda examples: preprocess_function(examples, tokenizer, MAX_SEQ_LENGTH),

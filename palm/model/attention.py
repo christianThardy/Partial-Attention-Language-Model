@@ -6,16 +6,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Logger object
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 # Set the level of the logger. Possible values: DEBUG, INFO, WARNING, ERROR, CRITICAL
-logger.setLevel(logging.DEBUG)
-# Handler that writes log messages to the notebook's output
-handler = logging.StreamHandler()
-# Set the format for the log messages
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-# Add the handler to the logger
-logger.addHandler(handler)
+# logger.setLevel(logging.DEBUG)
+# # Handler that writes log messages to the notebook's output
+# handler = logging.StreamHandler()
+# # Set the format for the log messages
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# handler.setFormatter(formatter)
+# # Add the handler to the logger
+# logger.addHandler(handler)
+logger.setLevel(logging.WARNING)  # Changed from DEBUG to reduce overhead during training
 
 
 class PALMAttention(nn.Module):
@@ -47,20 +48,42 @@ class PALMAttention(nn.Module):
         return x.permute(0, 2, 1, 3) # Permute dimensions to (batch, heads, seq_len, head_size)
 
 
-    def forward(self, hidden_states, attention_mask=None):
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None, use_cache=False):
+        """
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
+            attention_mask: Attention mask in additive form (0=attend, -10000=mask)
+            past_key_value: Tuple of (past_key, past_value) for KV caching
+            use_cache: Whether to return key/value for caching
+        
+        Returns:
+            attention_output: Output tensor
+            present_key_value: Tuple of (key, value) if use_cache=True, else None
+        """
         try:
-            logger.debug(f"Hidden states shape: {hidden_states.shape}") # Log shape of hidden states
-            query_layer = self.transpose_for_scores(self.query(hidden_states)) # Compute query matrix
-            key_layer = self.transpose_for_scores(self.key(hidden_states)) # Compute key matrix
-            value_layer = self.transpose_for_scores(self.value(hidden_states)) # Compute value matrix
+            logger.debug(f"Hidden states shape: {hidden_states.shape}")
+            
+            # Compute Q, K, V for current input
+            query_layer = self.transpose_for_scores(self.query(hidden_states))
+            key_layer = self.transpose_for_scores(self.key(hidden_states))
+            value_layer = self.transpose_for_scores(self.value(hidden_states))
+    
+            # If we have cached key/values, concatenate with current
+            if past_key_value is not None:
+                past_key, past_value = past_key_value
+                key_layer = torch.cat([past_key, key_layer], dim=2)
+                value_layer = torch.cat([past_value, value_layer], dim=2)
+            
+            # Store for caching if requested
+            present_key_value = (key_layer, value_layer) if use_cache else None
     
             logger.debug(f"Query layer shape: {query_layer.shape}")
             logger.debug(f"Key layer shape: {key_layer.shape}")
             logger.debug(f"Value layer shape: {value_layer.shape}")
     
-            # Calculate attention scores by performing matrix multiplication between query and key layers
+            # Calculate attention scores
             attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            attention_scores = attention_scores / math.sqrt(self.attention_head_size) # Scale the scores
+            attention_scores = attention_scores / math.sqrt(self.attention_head_size)
     
             logger.debug(f"Attention scores shape: {attention_scores.shape}")
     
@@ -73,48 +96,45 @@ class PALMAttention(nn.Module):
                 elif attention_mask.dim() == 3:
                     attention_mask = attention_mask.unsqueeze(1)
                 
-                # Convert attention mask to float and scale it to large negative values where mask is 0
+                # Mask is already in additive form (0 = attend, -10000 = mask out)
                 attention_mask = attention_mask.to(dtype=torch.float32)
-                attention_mask = (1.0 - attention_mask) * -10000.0
     
                 logger.debug(f"Reshaped attention mask shape: {attention_mask.shape}")
     
-            attention_scores = attention_scores + attention_mask # Apply attention mask
+                attention_scores = attention_scores + attention_mask
     
-            # Compute attention probabilities using softmax
+            # Compute attention probabilities
             attention_probs = F.softmax(attention_scores, dim=-1)
             logger.debug(f"Attention probs shape: {attention_probs.shape}")
     
-            # Apply dropout to the attention probabilities
             attention_probs = self.dropout(attention_probs)
 
-            # Compute context layer by applying attention to the value layer
+            # Compute context layer
             context_layer = torch.matmul(attention_probs, value_layer)
     
             logger.debug(f"Context layer shape before permute: {context_layer.shape}")
-            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()  # Permute dimensions back
+            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
             logger.debug(f"Context layer shape after permute: {context_layer.shape}")
     
-            # Reshape context layer to combine attention heads
             new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
             context_layer = context_layer.view(*new_context_layer_shape)
     
             logger.debug(f"Context layer shape after reshaping: {context_layer.shape}")
     
-            # Pass context layer through a dense layer and apply layer normalization
+            # Output projection and residual connection
             attention_output = self.dense(context_layer)
             attention_output = self.dropout(attention_output)
             attention_output = self.LayerNorm(attention_output + hidden_states)
     
             logger.debug(f"Attention output shape: {attention_output.shape}")
     
-            return attention_output # Return the final attention output
+            return attention_output, present_key_value
     
         except Exception as e:
             logger.error(f"Error in PALMAttention forward pass: {str(e)}")
             logger.error(f"Input shapes - hidden_states: {hidden_states.shape} "
                          f"attention_mask: {attention_mask.shape if attention_mask is not None else 'None'}")
-            raise  # Re-raise the exception for further handling
+            raise
 
 
 class PALMPartialAttention(nn.Module):
@@ -158,67 +178,60 @@ class PALMPartialAttention(nn.Module):
         # Permute dimensions to (batch, heads, seq_len, head_size)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states, source_states, attention_mask=None):
-        # Apply feed-forward network to the source states
-        P = self.Fp(source_states)
+    def forward(self, hidden_states, source_states, attention_mask=None, past_key_value=None, use_cache=False):
+        """
+        Args:
+            hidden_states: Input tensor of shape (batch, seq_len, hidden_size)
+            source_states: Source tensor of shape (batch, source_len, hidden_size)
+            attention_mask: Not used for partial attention (all positions attend to all source)
+            past_key_value: Tuple of (past_key, past_value) from source - can be reused
+            use_cache: Whether to return key/value for caching
+        
+        Returns:
+            attention_output: Output tensor
+            present_key_value: Tuple of (key, value) if use_cache=True, else None
+        """
+        # For partial attention, source K/V can be cached and reused since source doesn't change
+        if past_key_value is not None:
+            # Reuse cached source K/V
+            key_layer, value_layer = past_key_value
+        else:
+            # Compute K/V from source states
+            P = self.Fp(source_states)
+            key_layer = self.transpose_for_scores(self.key(P))
+            value_layer = self.transpose_for_scores(self.value(P))
+        
+        # Store for caching if requested
+        present_key_value = (key_layer, value_layer) if use_cache else None
     
-        # Compute query matrix
+        # Compute query matrix from full hidden states (always recomputed)
         query_layer = self.transpose_for_scores(self.query(hidden_states))
-        
-        # Compute key matrix from the transformed source states
-        key_layer = self.transpose_for_scores(self.key(P))
 
-        # Compute value matrix from the transformed source states
-        value_layer = self.transpose_for_scores(self.value(P))
-
-        # Calculate attention scores
+        # Calculate attention scores: (batch, heads, seq_len, source_len)
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        
-        # Scale the scores
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
     
-        if attention_mask is not None:
-            # Ensure attention_mask has the correct shape (4D tensor)
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            elif attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            
-            # Convert attention mask to float and scale it to large negative values where mask is 0
-            attention_mask = (1.0 - attention_mask.float()) * -10000.0
-            
-            # Apply attention mask, but only for the source sequence part
-            source_attention_mask = attention_mask[:, :, :, :self.fixed_source_length]
-            attention_scores = attention_scores + source_attention_mask
+        # NOTE: Partial attention does NOT use the causal/bidirectional mask
+        # All tokens can attend to ALL source tokens - this is the key mechanism
     
-        # Compute attention probabilities using softmax
+        # Compute attention probabilities
         attention_probs = F.softmax(attention_scores, dim=-1)
-
-        # Apply dropout to the attention probabilities
         attention_probs = self.dropout(attention_probs)
     
-        # Compute context layer by applying attention to the value layer
+        # Compute context layer
         context_layer = torch.matmul(attention_probs, value_layer)
         
-        # Ensure context_layer has the expected number of dimensions
         if context_layer.dim() != 4:
-            print(f"Unexpected context_layer shape: {context_layer.shape}")
             context_layer = context_layer.view(hidden_states.size(0), -1, self.num_attention_heads, self.attention_head_size)
         
-        # Permute dimensions back
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        
-        # Reshape the context layer
         context_layer = context_layer.view(*new_context_layer_shape)
     
-        # Pass context layer through a dense layer and apply layer normalization
+        # Output projection and residual connection
         attention_output = self.dense(context_layer)
         attention_output = self.dropout(attention_output)
-
-        # Residual connection
         attention_output = self.LayerNorm(attention_output + hidden_states)
     
-        # Return the final attention output
-        return attention_output
+        return attention_output, present_key_value
     

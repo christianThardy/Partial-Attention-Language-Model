@@ -1,0 +1,9 @@
+# Notebooks
+/notebooks/*
+
+# Tests
+/tests/unit_tests_deprecated.py
+/tests/test_cuda.py
+
+# Other
+/.pytest_cache/

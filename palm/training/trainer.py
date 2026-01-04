@@ -72,14 +72,15 @@ class PALMTrainer:
                     source_len=source_len
                 )
 
-                # Compute accuracy
+                # Compute accuracy only on non-masked positions (labels != -100)
                 preds = lm_logits.argmax(dim=-1)  # Get the index of the highest logit for each token
-                correct = (preds == labels).float() * attention_mask  # Compare predictions to labels
+                label_mask = (labels != -100)  # Only count positions that contribute to loss
+                correct = (preds == labels).float() * label_mask.float()  # Compare predictions to labels
                 total_correct += correct.sum().item()  # Sum the correct predictions
-                total_predictions += attention_mask.sum().item()  # Sum the number of tokens predicted
+                total_predictions += label_mask.sum().item()  # Sum the number of tokens predicted
                 
-                # Calculate and log accuracy
-                accuracy = total_correct / total_predictions  # Compute the accuracy
+                # Calculate and log accuracy (avoid division by zero)
+                accuracy = total_correct / max(total_predictions, 1)  # Compute the accuracy
 
                 # Scale combined loss for gradient accumulation
                 combined_loss = combined_loss / self.config.gradient_accumulation_steps
