@@ -45,7 +45,7 @@ PALM enhances standard decoder-only models by introducing:
 ```bash
 # Clone and install
 git clone https://github.com/christianThardy/Partial-Attention-Language-Model.git
-cd Partial-Attention-Large-Language-Model
+cd Partial-Attention-Language-Model
 pip install torch transformers peft bitsandbytes wandb tqdm safetensors datasets
 
 # Run the training notebook
