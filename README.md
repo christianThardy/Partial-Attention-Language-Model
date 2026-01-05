@@ -112,7 +112,7 @@ model = transfer_weights_to_palm(model, "Qwen/Qwen2.5-3B")
 
 **What transfers:** Self-attention projections (Q/K/V/O), MLP weights, embeddings, LM head; the bulk of the model.
 
-**What's fresh:** Partial attention layers, SAE head, language embeddings, Fp transformation; the PALM-specific additions that get trained.
+**What's fresh:** The PALM-specific additions that get trained: partial attention layers, SAE head, language embeddings, Fp transformation.
 
 ### LoRA / QLoRA Fine-tuning
 
