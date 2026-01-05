@@ -356,7 +356,7 @@ class PALMModel(nn.Module):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embeddings(input_ids, position_offset=position_offset)
+                hidden_states = self.embeddings(input_ids, source_len=source_len, position_offset=position_offset)
             
             # Calculate max source length for layers (each layer extracts source from its attention output)
             max_source_len = min(source_len.max().item(), seq_length)
@@ -517,6 +517,7 @@ class PALMModel(nn.Module):
                     outputs = self(
                         model_input_ids,
                         attention_mask=attention_mask,
+                        source_len=torch.tensor([original_source_length], device=device),
                         past_key_values=past_key_values,
                         use_cache=use_cache,
                         position_offset=position_offset

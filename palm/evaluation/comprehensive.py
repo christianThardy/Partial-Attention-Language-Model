@@ -319,8 +319,13 @@ def compute_mask_compliance(
         attn = layer.attention
         
         # Compute attention scores manually
-        query = attn.transpose_for_scores(attn.query(hidden_states))
-        key = attn.transpose_for_scores(attn.key(hidden_states))
+        # Note: transpose_for_scores requires num_heads - queries use num_attention_heads, keys use num_kv_heads
+        query = attn.transpose_for_scores(attn.query(hidden_states), attn.num_attention_heads)
+        key = attn.transpose_for_scores(attn.key(hidden_states), attn.num_kv_heads)
+        
+        # GQA: Repeat KV heads to match query heads
+        from palm.model.attention import repeat_kv
+        key = repeat_kv(key, attn.num_kv_groups)
         
         scores = torch.matmul(query, key.transpose(-1, -2))
         scores = scores / math.sqrt(attn.attention_head_size)

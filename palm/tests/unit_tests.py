@@ -370,8 +370,13 @@ def test_attention_probability_mass():
     attn_layer = model.layers[0].attention
     
     # Manually compute attention to inspect probabilities
-    query_layer = attn_layer.transpose_for_scores(attn_layer.query(hidden_states))
-    key_layer = attn_layer.transpose_for_scores(attn_layer.key(hidden_states))
+    # Note: transpose_for_scores requires num_heads - queries use num_attention_heads, keys use num_kv_heads
+    query_layer = attn_layer.transpose_for_scores(attn_layer.query(hidden_states), attn_layer.num_attention_heads)
+    key_layer = attn_layer.transpose_for_scores(attn_layer.key(hidden_states), attn_layer.num_kv_heads)
+    
+    # GQA: Repeat KV heads to match query heads (imported from attention module)
+    from palm.model.attention import repeat_kv
+    key_layer = repeat_kv(key_layer, attn_layer.num_kv_groups)
     
     import math
     attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
@@ -677,6 +682,7 @@ def test_kv_cache_incremental():
         incremental_outputs = model(
             input_ids[:, 7:8],
             attention_mask=incremental_mask,
+            source_len=torch.tensor([5]),  # Must pass source_len for correct embeddings
             past_key_values=past_kv,
             use_cache=True,
             position_offset=7  # 8th token is at position 7
