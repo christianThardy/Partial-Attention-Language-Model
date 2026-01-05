@@ -199,7 +199,9 @@ def compute_mask_compliance_fast(
     
     # Get attention mask and embeddings
     attention_mask = model.create_bidirectional_attention_mask(input_ids)
-    hidden_states = model.embeddings(input_ids)
+    # PALMEmbeddings returns (embeddings, position_ids) for RoPE-compatible models
+    emb_out = model.embeddings(input_ids)
+    hidden_states = emb_out[0] if isinstance(emb_out, (tuple, list)) else emb_out
     
     # Sample evenly-spaced layers
     num_layers = len(model.layers)
@@ -289,6 +291,26 @@ class LightweightEvaluator:
         self.eval_samples = eval_samples
         self.max_gen_tokens = max_gen_tokens
         self.device = next(model.parameters()).device
+    
+    def _get_base_model(self):
+        """
+        Get the underlying PALMModel, unwrapping PEFT layers if present.
+        
+        Handles PEFT-wrapped models by extracting the base PALMModel
+        which has the required methods (embeddings, layers, create_bidirectional_attention_mask).
+        """
+        model = self.model
+        
+        # If wrapped by PEFT, get the underlying PALMModel
+        # PEFT wraps as: PeftModelForCausalLM -> LoraModel -> PALMModel
+        if hasattr(model, 'base_model'):
+            base = model.base_model
+            if hasattr(base, 'model'):
+                # This is the PALMModel
+                return base.model
+            return base
+        
+        return model
     
     @torch.no_grad()
     def run(
@@ -384,8 +406,10 @@ class LightweightEvaluator:
             full_ids = self.tokenizer.encode(source_text + target_stub, return_tensors="pt").to(self.device)
             source_len = source_ids.size(1)
             
+            # Get base model (unwrap PEFT if present)
+            base_model = self._get_base_model()
             future_leak, source_mass = compute_mask_compliance_fast(
-                self.model, full_ids, source_len, sample_layers=3
+                base_model, full_ids, source_len, sample_layers=3
             )
         
         # PALM score
