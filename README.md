@@ -10,11 +10,11 @@ This creates a stable channel for conditioning on prompt instructions, system co
 
 ## How it works
 
-<img width="2036" height="1000" alt="Image" src="https://github.com/user-attachments/assets/f7b03fbd-d1e5-4d53-8da7-c295ccab7396" />
+<img width="2041" height="1035" alt="Image" src="https://github.com/user-attachments/assets/2f8916fe-0532-42fb-9725-f2d6c36fd62d" />
 
 ## Overview
 
-PALM operationalizes research that re-interprets decoder-only architectures as regularized encoder-decoders (Fu et al.). By treating the model as an architectural wrapper, PALM integrates partial attention mechanisms into existing open-weights (Llama, Mistral, Qwen, etc.) while preserving their fundamental learned representations.
+This PALM implementation operationalizes and modernizes research that re-interprets decoder-only architectures as regularized encoder-decoders (Fu et al.), but for autoregressive chat models. By treating the model as an architectural wrapper, PALM integrates partial attention mechanisms into existing open-weights (Llama, Mistral, Qwen, etc.) while preserving their fundamental learned representations.
 
 PALM enhances standard decoder-only models by introducing:
 

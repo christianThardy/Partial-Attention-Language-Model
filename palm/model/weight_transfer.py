@@ -3,6 +3,15 @@ Weight Transfer Utilities for PALM
 
 Supports transferring pretrained weights from various HuggingFace models
 (Llama, Qwen, Mistral, Phi, Gemma, Falcon, etc.) to PALMModel architecture.
+
+Key features:
+- Transfers RoPE (Rotary Position Embeddings) inv_freq for preserving positional understanding
+- Bootstraps PALM-specific components (partial attention, SAE head) from pretrained weights
+- Handles GQA → MHA expansion for partial attention
+
+Updated for modern PALM architecture:
+- SwiGLU MLP (gate_proj, up_proj, down_proj)
+- Pre-Norm with RMSNorm (attn_norm, partial_attn_norm, mlp_norm, final_norm)
 """
 
 import gc
@@ -20,9 +29,6 @@ def detect_model_architecture(model_name_or_config: Union[str, "PretrainedConfig
     """
     Detect the architecture type from a model name or config.
     
-    Args:
-        model_name_or_config: HuggingFace model name or config object
-    
     Returns:
         Architecture family identifier: 'llama', 'qwen', 'mistral', 'phi', 'gemma', 'falcon'
     """
@@ -34,7 +40,6 @@ def detect_model_architecture(model_name_or_config: Union[str, "PretrainedConfig
     arch = getattr(config, 'model_type', '').lower()
     architectures = getattr(config, 'architectures', [])
     
-    # Map to architecture families
     if 'llama' in arch or any('llama' in a.lower() for a in architectures):
         return 'llama'
     elif 'qwen' in arch or any('qwen' in a.lower() for a in architectures):
@@ -57,9 +62,9 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
     """
     Get weight key mappings from source model to PALM model.
     
-    Args:
-        arch_type: Architecture family ('llama', 'qwen', 'mistral', etc.)
-        num_layers: Number of transformer layers to map
+    Updated for modern PALM architecture:
+    - SwiGLU MLP: gate_proj, up_proj, down_proj
+    - Pre-Norm: attn_norm, mlp_norm, final_norm
     
     Returns:
         Dict mapping source keys to PALM keys (None means skip)
@@ -67,59 +72,75 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
     mapping = {}
     
     if arch_type in ['llama', 'mistral', 'gemma']:
+        # Embeddings and LM head
         mapping['model.embed_tokens.weight'] = 'embeddings.word_embeddings.weight'
         mapping['lm_head.weight'] = 'lm_head.weight'
-        mapping['model.norm.weight'] = None  # PALM uses per-layer norms
+        
+        # Final norm (maps to PALM's final_norm for Pre-Norm architecture)
+        mapping['model.norm.weight'] = 'final_norm.weight'
         
         for i in range(num_layers):
             src_prefix = f'model.layers.{i}'
             dst_prefix = f'layers.{i}'
             
-            # Self-attention
+            # Self-attention projections
             mapping[f'{src_prefix}.self_attn.q_proj.weight'] = f'{dst_prefix}.attention.query.weight'
             mapping[f'{src_prefix}.self_attn.k_proj.weight'] = f'{dst_prefix}.attention.key.weight'
             mapping[f'{src_prefix}.self_attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
             mapping[f'{src_prefix}.self_attn.o_proj.weight'] = f'{dst_prefix}.attention.dense.weight'
             
-            # Layer norms
-            mapping[f'{src_prefix}.input_layernorm.weight'] = f'{dst_prefix}.attention.LayerNorm.weight'
+            # Pre-attention norm → PALM's attn_norm (RMSNorm)
+            mapping[f'{src_prefix}.input_layernorm.weight'] = f'{dst_prefix}.attn_norm.weight'
             
-            # MLP
-            mapping[f'{src_prefix}.mlp.gate_proj.weight'] = f'{dst_prefix}.intermediate.dense.weight'
-            mapping[f'{src_prefix}.mlp.down_proj.weight'] = f'{dst_prefix}.output.dense.weight'
+            # Post-attention / MLP norm → PALM's mlp_norm (RMSNorm)
+            mapping[f'{src_prefix}.post_attention_layernorm.weight'] = f'{dst_prefix}.mlp_norm.weight'
+            
+            # SwiGLU MLP (Llama-style gate_proj, up_proj, down_proj → PALM's SwiGLU)
+            mapping[f'{src_prefix}.mlp.gate_proj.weight'] = f'{dst_prefix}.mlp.gate_proj.weight'
+            mapping[f'{src_prefix}.mlp.up_proj.weight'] = f'{dst_prefix}.mlp.up_proj.weight'
+            mapping[f'{src_prefix}.mlp.down_proj.weight'] = f'{dst_prefix}.mlp.down_proj.weight'
             
     elif arch_type == 'qwen':
+        # Qwen v1 and v2 embeddings
         mapping['transformer.wte.weight'] = 'embeddings.word_embeddings.weight'
+        mapping['model.embed_tokens.weight'] = 'embeddings.word_embeddings.weight'
         mapping['lm_head.weight'] = 'lm_head.weight'
         
+        # Final norm
+        mapping['transformer.ln_f.weight'] = 'final_norm.weight'
+        mapping['model.norm.weight'] = 'final_norm.weight'
+        
         for i in range(num_layers):
-            src_prefix = f'transformer.h.{i}'
             dst_prefix = f'layers.{i}'
             
             # Qwen v1 style
-            mapping[f'{src_prefix}.attn.q_proj.weight'] = f'{dst_prefix}.attention.query.weight'
-            mapping[f'{src_prefix}.attn.k_proj.weight'] = f'{dst_prefix}.attention.key.weight'
-            mapping[f'{src_prefix}.attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
-            mapping[f'{src_prefix}.attn.c_proj.weight'] = f'{dst_prefix}.attention.dense.weight'
+            src_v1 = f'transformer.h.{i}'
+            mapping[f'{src_v1}.attn.q_proj.weight'] = f'{dst_prefix}.attention.query.weight'
+            mapping[f'{src_v1}.attn.k_proj.weight'] = f'{dst_prefix}.attention.key.weight'
+            mapping[f'{src_v1}.attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
+            mapping[f'{src_v1}.attn.c_proj.weight'] = f'{dst_prefix}.attention.dense.weight'
+            mapping[f'{src_v1}.ln_1.weight'] = f'{dst_prefix}.attn_norm.weight'
+            mapping[f'{src_v1}.ln_2.weight'] = f'{dst_prefix}.mlp_norm.weight'
+            mapping[f'{src_v1}.mlp.w1.weight'] = f'{dst_prefix}.mlp.gate_proj.weight'
+            mapping[f'{src_v1}.mlp.w2.weight'] = f'{dst_prefix}.mlp.down_proj.weight'
+            mapping[f'{src_v1}.mlp.w3.weight'] = f'{dst_prefix}.mlp.up_proj.weight'
             
             # Qwen2 style
-            mapping[f'model.layers.{i}.self_attn.q_proj.weight'] = f'{dst_prefix}.attention.query.weight'
-            mapping[f'model.layers.{i}.self_attn.k_proj.weight'] = f'{dst_prefix}.attention.key.weight'
-            mapping[f'model.layers.{i}.self_attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
-            mapping[f'model.layers.{i}.self_attn.o_proj.weight'] = f'{dst_prefix}.attention.dense.weight'
-            
-            mapping[f'{src_prefix}.ln_1.weight'] = f'{dst_prefix}.attention.LayerNorm.weight'
-            
-            mapping[f'{src_prefix}.mlp.w1.weight'] = f'{dst_prefix}.intermediate.dense.weight'
-            mapping[f'{src_prefix}.mlp.w2.weight'] = f'{dst_prefix}.output.dense.weight'
-            
-            # Qwen2 MLP
-            mapping[f'model.layers.{i}.mlp.gate_proj.weight'] = f'{dst_prefix}.intermediate.dense.weight'
-            mapping[f'model.layers.{i}.mlp.down_proj.weight'] = f'{dst_prefix}.output.dense.weight'
+            src_v2 = f'model.layers.{i}'
+            mapping[f'{src_v2}.self_attn.q_proj.weight'] = f'{dst_prefix}.attention.query.weight'
+            mapping[f'{src_v2}.self_attn.k_proj.weight'] = f'{dst_prefix}.attention.key.weight'
+            mapping[f'{src_v2}.self_attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
+            mapping[f'{src_v2}.self_attn.o_proj.weight'] = f'{dst_prefix}.attention.dense.weight'
+            mapping[f'{src_v2}.input_layernorm.weight'] = f'{dst_prefix}.attn_norm.weight'
+            mapping[f'{src_v2}.post_attention_layernorm.weight'] = f'{dst_prefix}.mlp_norm.weight'
+            mapping[f'{src_v2}.mlp.gate_proj.weight'] = f'{dst_prefix}.mlp.gate_proj.weight'
+            mapping[f'{src_v2}.mlp.up_proj.weight'] = f'{dst_prefix}.mlp.up_proj.weight'
+            mapping[f'{src_v2}.mlp.down_proj.weight'] = f'{dst_prefix}.mlp.down_proj.weight'
             
     elif arch_type == 'phi':
         mapping['model.embed_tokens.weight'] = 'embeddings.word_embeddings.weight'
         mapping['lm_head.weight'] = 'lm_head.weight'
+        mapping['model.final_layernorm.weight'] = 'final_norm.weight'
         
         for i in range(num_layers):
             src_prefix = f'model.layers.{i}'
@@ -130,12 +151,21 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
             mapping[f'{src_prefix}.self_attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
             mapping[f'{src_prefix}.self_attn.dense.weight'] = f'{dst_prefix}.attention.dense.weight'
             
-            mapping[f'{src_prefix}.mlp.fc1.weight'] = f'{dst_prefix}.intermediate.dense.weight'
-            mapping[f'{src_prefix}.mlp.fc2.weight'] = f'{dst_prefix}.output.dense.weight'
+            mapping[f'{src_prefix}.input_layernorm.weight'] = f'{dst_prefix}.attn_norm.weight'
+            
+            # Phi uses different MLP structure - may need adaptation
+            # Phi-2 style (fc1/fc2 → needs conversion to SwiGLU)
+            mapping[f'{src_prefix}.mlp.fc1.weight'] = f'{dst_prefix}.mlp.up_proj.weight'
+            mapping[f'{src_prefix}.mlp.fc2.weight'] = f'{dst_prefix}.mlp.down_proj.weight'
+            
+            # Phi-3 style (SwiGLU)
+            mapping[f'{src_prefix}.mlp.gate_up_proj.weight'] = None  # Fused, needs special handling
+            mapping[f'{src_prefix}.mlp.down_proj.weight'] = f'{dst_prefix}.mlp.down_proj.weight'
             
     elif arch_type == 'falcon':
         mapping['transformer.word_embeddings.weight'] = 'embeddings.word_embeddings.weight'
         mapping['lm_head.weight'] = 'lm_head.weight'
+        mapping['transformer.ln_f.weight'] = 'final_norm.weight'
         
         for i in range(num_layers):
             src_prefix = f'transformer.h.{i}'
@@ -145,10 +175,40 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
             mapping[f'{src_prefix}.self_attention.query_key_value.weight'] = None
             mapping[f'{src_prefix}.self_attention.dense.weight'] = f'{dst_prefix}.attention.dense.weight'
             
-            mapping[f'{src_prefix}.mlp.dense_h_to_4h.weight'] = f'{dst_prefix}.intermediate.dense.weight'
-            mapping[f'{src_prefix}.mlp.dense_4h_to_h.weight'] = f'{dst_prefix}.output.dense.weight'
+            mapping[f'{src_prefix}.input_layernorm.weight'] = f'{dst_prefix}.attn_norm.weight'
+            
+            # Falcon MLP
+            mapping[f'{src_prefix}.mlp.dense_h_to_4h.weight'] = f'{dst_prefix}.mlp.up_proj.weight'
+            mapping[f'{src_prefix}.mlp.dense_4h_to_h.weight'] = f'{dst_prefix}.mlp.down_proj.weight'
     
     return mapping
+
+
+def _get_rope_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str]:
+    """
+    Get source RoPE (inv_freq) key patterns for a given architecture.
+    
+    Most modern models store inv_freq as a buffer in the rotary embedding class.
+    """
+    i = layer_idx
+    
+    if arch_type in ['llama', 'mistral', 'gemma']:
+        return {
+            'inv_freq': f'model.layers.{i}.self_attn.rotary_emb.inv_freq',
+        }
+    elif arch_type == 'qwen':
+        return {
+            'inv_freq': f'model.layers.{i}.self_attn.rotary_emb.inv_freq',
+            'inv_freq_alt': f'transformer.h.{i}.attn.rotary_emb.inv_freq',
+        }
+    elif arch_type == 'phi':
+        return {
+            'inv_freq': f'model.layers.{i}.self_attn.rotary_emb.inv_freq',
+        }
+    else:
+        return {
+            'inv_freq': f'model.layers.{i}.self_attn.rotary_emb.inv_freq',
+        }
 
 
 # WEIGHT TRANSFER
@@ -161,27 +221,24 @@ def transfer_weights_to_palm(
     """
     Transfer pretrained weights from any supported HuggingFace model to PALMModel.
     
-    Compatible weights from the source model's self-attention and MLP layers are
-    transferred to PALM's corresponding layers. Components unique to PALM 
-    (partial_attention, sae_head, Fp, language_embeddings, position_embeddings)
-    remain randomly initialized.
+    Key transfers:
+    1. Word embeddings, attention projections, MLP weights
+    2. RoPE inv_freq parameters (preserves pretrained positional understanding)
+    3. Bootstraps PALM-specific components from pretrained weights
+    
+    Components initialized fresh (not from pretrained):
+    - language_embeddings (PALM-specific source/target differentiation)
+    - partial_attention Fp network (initialized as near-identity)
+    - partial_attn_norm (cloned from attn_norm)
     
     Args:
         palm_model: Initialized PALMModel instance
-        source_model_name: HuggingFace model name/path (e.g., "meta-llama/Llama-3.2-3B")
-        device: Device to load source model on temporarily ('cpu' recommended to avoid OOM)
+        source_model_name: HuggingFace model name/path
+        device: Device to load source model on temporarily
         dtype: Data type for loading source model
     
     Returns:
         palm_model with transferred weights
-        
-    Supported architectures:
-        - Llama (all versions)
-        - Qwen / Qwen2
-        - Mistral
-        - Phi
-        - Gemma
-        - Falcon
     """
     logger.info(f"Loading pretrained weights from: {source_model_name}")
     
@@ -204,7 +261,7 @@ def transfer_weights_to_palm(
     source_state = source_model.state_dict()
     palm_state = palm_model.state_dict()
     
-    # Get number of layers to transfer (min of source and PALM)
+    # Get number of layers to transfer
     source_layers = getattr(source_config, 'num_hidden_layers', 
                            getattr(source_config, 'n_layer', 28))
     palm_layers = len(palm_model.layers)
@@ -243,12 +300,10 @@ def transfer_weights_to_palm(
         else:
             # Handle shape mismatches
             if 'embed' in dst_key and src_weight.shape[0] >= dst_weight.shape[0]:
-                # Vocabulary size mismatch - truncate if source is larger
                 palm_state[dst_key] = src_weight[:dst_weight.shape[0]].clone().to(dst_weight.dtype)
                 transferred += 1
                 logger.info(f"Truncated {src_key} from {src_weight.shape} to {dst_weight.shape}")
             elif len(src_weight.shape) == len(dst_weight.shape) == 2:
-                # Linear layer mismatch - transfer overlapping portion
                 min_in = min(src_weight.shape[1], dst_weight.shape[1])
                 min_out = min(src_weight.shape[0], dst_weight.shape[0])
                 palm_state[dst_key][:min_out, :min_in] = src_weight[:min_out, :min_in].clone().to(dst_weight.dtype)
@@ -261,10 +316,13 @@ def transfer_weights_to_palm(
     # Load the modified state dict
     palm_model.load_state_dict(palm_state, strict=False)
     
-    # Bootstrap PALM-specific components from pretrained weights (architecture-aware)
+    # Transfer RoPE inv_freq parameters
+    rope_transferred = transfer_rope_parameters(palm_model, source_state, arch_type, num_layers)
+    
+    # Bootstrap PALM-specific components from pretrained weights
     palm_state = bootstrap_palm_components(palm_model, source_state, palm_state, arch_type=arch_type)
     
-    # Clean up source model to free memory
+    # Clean up source model
     del source_model
     del source_state
     torch.cuda.empty_cache()
@@ -272,23 +330,86 @@ def transfer_weights_to_palm(
     
     logger.info(f"Weight transfer complete:")
     logger.info(f"  - Transferred: {transferred} tensors")
+    logger.info(f"  - RoPE inv_freq: {rope_transferred} layers")
     logger.info(f"  - Skipped: {skipped} tensors")
     logger.info(f"  - Shape mismatches: {shape_mismatch} tensors")
     
-    # Log which PALM components are initialized fresh
-    fresh_components = ['language_embeddings', 'position_embeddings']
+    # Components initialized fresh
+    fresh_components = ['language_embeddings', 'partial_attn_norm']
     logger.info(f"Components initialized fresh (not from pretrained): {fresh_components}")
     
     return palm_model
 
 
+def transfer_rope_parameters(
+    palm_model: torch.nn.Module,
+    source_state: Dict[str, torch.Tensor],
+    arch_type: str,
+    num_layers: int
+) -> int:
+    """
+    Transfer RoPE inv_freq parameters from source model to PALM.
+    
+    This preserves the pretrained positional understanding from the backbone model.
+    The inv_freq determines the rotation frequencies used in RoPE.
+    
+    Args:
+        palm_model: The PALM model to update
+        source_state: State dict from source model
+        arch_type: Architecture type
+        num_layers: Number of layers to transfer
+    
+    Returns:
+        Number of layers where RoPE was transferred
+    """
+    transferred = 0
+    
+    for i in range(num_layers):
+        patterns = _get_rope_key_patterns(arch_type, i)
+        
+        # Find source inv_freq
+        src_inv_freq = None
+        for key_name in ['inv_freq', 'inv_freq_alt']:
+            src_key = patterns.get(key_name)
+            if src_key and src_key in source_state:
+                src_inv_freq = source_state[src_key]
+                break
+        
+        if src_inv_freq is None:
+            continue
+        
+        # Transfer to main attention
+        attn_rotary = palm_model.layers[i].attention.rotary_emb
+        if hasattr(attn_rotary, 'inv_freq'):
+            if attn_rotary.inv_freq.shape == src_inv_freq.shape:
+                attn_rotary.inv_freq.copy_(src_inv_freq)
+                # Clear cached cos/sin so they're recomputed with new inv_freq
+                attn_rotary._cos_cached = None
+                attn_rotary._sin_cached = None
+                attn_rotary._cached_seq_len = 0
+            else:
+                logger.debug(f"RoPE shape mismatch layer {i}: src {src_inv_freq.shape} vs dst {attn_rotary.inv_freq.shape}")
+        
+        # Transfer to partial attention (same frequencies for consistency)
+        partial_attn_rotary = palm_model.layers[i].partial_attention.rotary_emb
+        if hasattr(partial_attn_rotary, 'inv_freq'):
+            if partial_attn_rotary.inv_freq.shape == src_inv_freq.shape:
+                partial_attn_rotary.inv_freq.copy_(src_inv_freq)
+                partial_attn_rotary._cos_cached = None
+                partial_attn_rotary._sin_cached = None
+                partial_attn_rotary._cached_seq_len = 0
+        
+        transferred += 1
+    
+    if transferred > 0:
+        logger.info(f"✓ Transferred RoPE inv_freq to {transferred} layers (both attention and partial_attention)")
+    
+    return transferred
+
+
 # PALM COMPONENT BOOTSTRAPPING
 def _get_attention_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str]:
-    """
-    Get source attention key patterns for a given architecture.
-    
-    Returns dict mapping projection type to source key pattern.
-    """
+    """Get source attention key patterns for a given architecture."""
     i = layer_idx
     
     if arch_type in ['llama', 'mistral', 'gemma']:
@@ -297,24 +418,20 @@ def _get_attention_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str
             'k': f'model.layers.{i}.self_attn.k_proj.weight',
             'v': f'model.layers.{i}.self_attn.v_proj.weight',
             'o': f'model.layers.{i}.self_attn.o_proj.weight',
-            'norm': f'model.layers.{i}.input_layernorm.weight',
-            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+            'attn_norm': f'model.layers.{i}.input_layernorm.weight',
         }
     elif arch_type == 'qwen':
-        # Try Qwen2 style first (more common now), fallback patterns handled at call site
         return {
             'q': f'model.layers.{i}.self_attn.q_proj.weight',
             'k': f'model.layers.{i}.self_attn.k_proj.weight',
             'v': f'model.layers.{i}.self_attn.v_proj.weight',
             'o': f'model.layers.{i}.self_attn.o_proj.weight',
-            'norm': f'model.layers.{i}.input_layernorm.weight',
-            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
-            # Qwen1 fallbacks
+            'attn_norm': f'model.layers.{i}.input_layernorm.weight',
             'q_alt': f'transformer.h.{i}.attn.q_proj.weight',
             'k_alt': f'transformer.h.{i}.attn.k_proj.weight',
             'v_alt': f'transformer.h.{i}.attn.v_proj.weight',
             'o_alt': f'transformer.h.{i}.attn.c_proj.weight',
-            'norm_alt': f'transformer.h.{i}.ln_1.weight',
+            'attn_norm_alt': f'transformer.h.{i}.ln_1.weight',
         }
     elif arch_type == 'phi':
         return {
@@ -322,28 +439,23 @@ def _get_attention_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str
             'k': f'model.layers.{i}.self_attn.k_proj.weight',
             'v': f'model.layers.{i}.self_attn.v_proj.weight',
             'o': f'model.layers.{i}.self_attn.dense.weight',
-            'norm': f'model.layers.{i}.input_layernorm.weight',
-            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+            'attn_norm': f'model.layers.{i}.input_layernorm.weight',
         }
     elif arch_type == 'falcon':
-        # Falcon uses fused QKV - can't bootstrap partial attention from it
         return {
-            'q': None,  # Fused QKV not supported
+            'q': None,
             'k': None,
             'v': None,
             'o': f'transformer.h.{i}.self_attention.dense.weight',
-            'norm': f'transformer.h.{i}.input_layernorm.weight',
-            'norm_bias': f'transformer.h.{i}.input_layernorm.bias',
+            'attn_norm': f'transformer.h.{i}.input_layernorm.weight',
         }
     else:
-        # Default to Llama-style (most common)
         return {
             'q': f'model.layers.{i}.self_attn.q_proj.weight',
             'k': f'model.layers.{i}.self_attn.k_proj.weight',
             'v': f'model.layers.{i}.self_attn.v_proj.weight',
             'o': f'model.layers.{i}.self_attn.o_proj.weight',
-            'norm': f'model.layers.{i}.input_layernorm.weight',
-            'norm_bias': f'model.layers.{i}.input_layernorm.bias',
+            'attn_norm': f'model.layers.{i}.input_layernorm.weight',
         }
 
 
@@ -354,52 +466,23 @@ def bootstrap_palm_components(
     arch_type: str = 'llama'
 ) -> Dict[str, torch.Tensor]:
     """
-    Bootstrap PALM-specific components from pretrained weights for better initialization.
+    Bootstrap PALM-specific components from pretrained weights.
     
     Strategy:
-    1. sae_head ← clone from lm_head (both predict tokens from hidden states)
-    2. partial_attention Q/K/V/dense ← clone from regular attention Q/K/V/o_proj
-       - Uses repeat_interleave for GQA→MHA expansion (not slicing)
-    3. partial_attention LayerNorm ← clone from input_layernorm (prevents activation shock)
-    4. Fp network ← identity-like init with Fp_linear2 = 0 (Fp(x) ≈ x initially)
+    1. partial_attention Q/K/V/dense ← clone from regular attention
+    2. partial_attn_norm ← clone from attn_norm (Pre-Norm architecture)
+    3. Fp network ← identity-like init (Fp(x) ≈ x initially)
     
-    This provides a much better starting point than random initialization:
-    - Lower initial SAE loss (starting from reasonable token prediction)
-    - Faster convergence (partial attention already "knows" how to attend)
-    - No activation shock (LayerNorm scales match pretrained model)
-    - More stable training (Fp outputs 0 initially, residual dominates)
-    
-    Supports architectures: Llama, Mistral, Gemma, Qwen, Qwen2, Phi, Falcon (partial)
-    
-    Args:
-        palm_model: The PALM model (for config access)
-        source_state: State dict from source pretrained model
-        palm_state: State dict from PALM model (will be modified in-place)
-        arch_type: Architecture type ('llama', 'qwen', 'mistral', 'phi', 'gemma', 'falcon')
-    
-    Returns:
-        Modified palm_state dict
+    Note: SAE head is tied to lm_head, so no separate bootstrapping needed.
     """
     num_layers = palm_model.config.num_hidden_layers
     bootstrapped_components = []
     
-    # 1. SAE HEAD ← CLONE FROM LM_HEAD
-    # Both project hidden_size → vocab_size, both predict tokens
-    if 'lm_head.weight' in source_state and 'sae_head.weight' in palm_state:
-        src_weight = source_state['lm_head.weight']
-        dst_dtype = palm_state['sae_head.weight'].dtype
-        palm_state['sae_head.weight'] = src_weight.clone().to(dst_dtype)
-        bootstrapped_components.append('sae_head')
-        logger.info("✓ Bootstrapped sae_head from lm_head")
-    
-    # 2. PARTIAL ATTENTION Q/K/V/DENSE ← CLONE FROM REGULAR ATTENTION
-    # This gives partial attention a head start with coherent attention patterns
+    # 1. PARTIAL ATTENTION Q/K/V/DENSE ← CLONE FROM REGULAR ATTENTION
     partial_attention_bootstrapped = 0
     for i in range(num_layers):
-        # Get architecture-specific key patterns
         patterns = _get_attention_key_patterns(arch_type, i)
         
-        # Map source attention → partial attention (architecture-aware)
         mappings = [
             (patterns['q'], f'layers.{i}.partial_attention.query.weight'),
             (patterns['k'], f'layers.{i}.partial_attention.key.weight'),
@@ -407,7 +490,6 @@ def bootstrap_palm_components(
             (patterns['o'], f'layers.{i}.partial_attention.dense.weight'),
         ]
         
-        # Add fallback patterns for Qwen1 if primary not found
         if arch_type == 'qwen':
             fallback_mappings = [
                 (patterns.get('q_alt'), f'layers.{i}.partial_attention.query.weight'),
@@ -419,14 +501,11 @@ def bootstrap_palm_components(
             fallback_mappings = []
         
         for src_key, dst_key in mappings:
-            # Skip if source key is None (e.g., Falcon's fused QKV)
             if src_key is None:
                 continue
             
-            # Try primary key, then fallback for Qwen1
             actual_src_key = src_key
             if src_key not in source_state and fallback_mappings:
-                # Find matching fallback
                 for fb_src, fb_dst in fallback_mappings:
                     if fb_dst == dst_key and fb_src and fb_src in source_state:
                         actual_src_key = fb_src
@@ -442,77 +521,46 @@ def bootstrap_palm_components(
             if src_w.shape == dst_w.shape:
                 palm_state[dst_key] = src_w.clone().to(dst_dtype)
             else:
-                # Handle GQA → MHA expansion using repeat_interleave
-                # Source GQA has fewer K/V heads than PALM's full MHA
-                # We repeat each source head to fill the destination heads
                 if dst_w.shape[0] > src_w.shape[0] and dst_w.shape[0] % src_w.shape[0] == 0:
-                    # GQA → MHA: repeat K/V heads to match destination
                     num_repeats = dst_w.shape[0] // src_w.shape[0]
                     expanded = src_w.repeat_interleave(num_repeats, dim=0)
-                    # Handle input dimension if also different
                     if expanded.shape[1] != dst_w.shape[1]:
                         min_in = min(expanded.shape[1], dst_w.shape[1])
                         palm_state[dst_key][:, :min_in] = expanded[:, :min_in].clone().to(dst_dtype)
                     else:
                         palm_state[dst_key] = expanded.clone().to(dst_dtype)
-                    logger.debug(f"GQA→MHA expand {actual_src_key} {src_w.shape} -> {dst_key} {dst_w.shape} (repeat {num_repeats}x)")
+                    logger.debug(f"GQA→MHA expand {actual_src_key} {src_w.shape} -> {dst_key} {dst_w.shape}")
                 else:
-                    # Fallback: partial transfer for other mismatches
                     min_out = min(src_w.shape[0], dst_w.shape[0])
                     min_in = min(src_w.shape[1], dst_w.shape[1])
                     palm_state[dst_key][:min_out, :min_in] = src_w[:min_out, :min_in].clone().to(dst_dtype)
-                    logger.debug(f"Partial bootstrap {actual_src_key} {src_w.shape} -> {dst_key} {dst_w.shape}")
             
             partial_attention_bootstrapped += 1
     
     if partial_attention_bootstrapped > 0:
         bootstrapped_components.append('partial_attention')
-        logger.info(f"✓ Bootstrapped partial_attention Q/K/V/dense for {num_layers} layers "
-                   f"({partial_attention_bootstrapped} tensors)")
+        logger.info(f"✓ Bootstrapped partial_attention Q/K/V/dense for {num_layers} layers")
     
-    # 3. LAYERNORM CLONING ← CLONE INPUT_LAYERNORM TO PARTIAL_ATTENTION
-    # The trained LayerNorm weights compensate for activation drift in that specific layer.
-    # Using default LayerNorm (scale=1.0) with cloned attention weights causes "activation shock".
-    # Clone input_layernorm.weight to partial_attention's LayerNorm for proper scaling.
-    layernorm_bootstrapped = 0
+    # 2. PARTIAL_ATTN_NORM ← CLONE FROM ATTN_NORM (Pre-Norm architecture)
+    norm_bootstrapped = 0
     for i in range(num_layers):
-        # Get architecture-specific LayerNorm key
-        patterns = _get_attention_key_patterns(arch_type, i)
-        src_norm_key = patterns.get('norm')
-        src_bias_key = patterns.get('norm_bias')
-        dst_norm_key = f'layers.{i}.partial_attention.LayerNorm.weight'
-        dst_bias_key = f'layers.{i}.partial_attention.LayerNorm.bias'
+        # Clone attn_norm to partial_attn_norm
+        src_norm_key = f'layers.{i}.attn_norm.weight'
+        dst_norm_key = f'layers.{i}.partial_attn_norm.weight'
         
-        # Try primary key, then fallback (for Qwen1)
-        if src_norm_key and src_norm_key not in source_state:
-            alt_key = patterns.get('norm_alt')
-            if alt_key and alt_key in source_state:
-                src_norm_key = alt_key
-        
-        if src_norm_key and src_norm_key in source_state and dst_norm_key in palm_state:
-            src_norm = source_state[src_norm_key]
-            dst_dtype = palm_state[dst_norm_key].dtype
-            palm_state[dst_norm_key] = src_norm.clone().to(dst_dtype)
-            layernorm_bootstrapped += 1
-        
-        # Also clone bias if present
-        if src_bias_key and src_bias_key in source_state and dst_bias_key in palm_state:
-            palm_state[dst_bias_key] = source_state[src_bias_key].clone().to(palm_state[dst_bias_key].dtype)
+        if src_norm_key in palm_state and dst_norm_key in palm_state:
+            palm_state[dst_norm_key] = palm_state[src_norm_key].clone()
+            norm_bootstrapped += 1
     
-    if layernorm_bootstrapped > 0:
-        bootstrapped_components.append('partial_attention_LayerNorm')
-        logger.info(f"✓ Cloned input_layernorm to partial_attention.LayerNorm for {layernorm_bootstrapped} layers")
+    if norm_bootstrapped > 0:
+        bootstrapped_components.append('partial_attn_norm')
+        logger.info(f"✓ Cloned attn_norm to partial_attn_norm for {norm_bootstrapped} layers")
     
-    # 4. Fp NETWORK ← IDENTITY-LIKE INITIALIZATION
-    # Goal: Fp(x) ≈ x initially, so partial attention starts by just copying source
-    # Paper uses Pl = Pl2 + Pl1 (residual), so we want:
-    #   - Fp_linear1 ≈ identity (with small noise)
-    #   - Fp_linear2 ≈ small values (residual dominates)
+    # 3. Fp NETWORK ← IDENTITY-LIKE INITIALIZATION
     fp_initialized = 0
     for i in range(num_layers):
         fp_prefix = f'layers.{i}.partial_attention'
         
-        # Fp_linear1: Initialize close to identity
         fp1_key = f'{fp_prefix}.Fp_linear1.weight'
         if fp1_key in palm_state:
             weight = palm_state[fp1_key]
@@ -520,30 +568,22 @@ def bootstrap_palm_components(
             device = weight.device
             dtype = weight.dtype
             
-            # Small random noise + scaled identity for residual path
-            # The identity component ensures Fp(x) ≈ x initially
             identity_like = torch.eye(hidden_size, device=device, dtype=dtype)
             palm_state[fp1_key] = 0.01 * torch.randn_like(weight) + 0.1 * identity_like
             fp_initialized += 1
         
-        # Fp_linear2: Initialize to ZERO (not small noise)
-        # With ReLU activation between Fp_linear1 and Fp_linear2, small noise can still
-        # produce non-zero outputs. Zero init ensures Fp block outputs exactly 0 initially,
-        # letting the residual connection dominate completely.
         fp2_key = f'{fp_prefix}.Fp_linear2.weight'
         if fp2_key in palm_state:
             palm_state[fp2_key] = torch.zeros_like(palm_state[fp2_key])
             fp_initialized += 1
         
-        # Zero biases if present (lets the weight matrices do the work)
         for bias_key in [f'{fp_prefix}.Fp_linear1.bias', f'{fp_prefix}.Fp_linear2.bias']:
             if bias_key in palm_state:
                 palm_state[bias_key] = torch.zeros_like(palm_state[bias_key])
     
     if fp_initialized > 0:
         bootstrapped_components.append('Fp_network')
-        logger.info(f"✓ Initialized Fp network as near-identity (residual-dominant) "
-                   f"({fp_initialized} tensors)")
+        logger.info(f"✓ Initialized Fp network as near-identity ({fp_initialized} tensors)")
     
     # Load the modified state dict back to model
     palm_model.load_state_dict(palm_state, strict=False)

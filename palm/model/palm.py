@@ -1,8 +1,9 @@
 import os
 import logging
 import math
+from typing import Optional, Tuple, List, Dict, Any
 
-from .attention import PALMAttention, PALMPartialAttention
+from .attention import PALMAttention, PALMPartialAttention, RMSNorm
 from .embeddings import PALMEmbeddings
 
 import torch
@@ -16,91 +17,93 @@ import glob
 
 # Logger object
 logger = logging.getLogger(__name__)
-# # Set the level of the logger. Possible values: DEBUG, INFO, WARNING, ERROR, CRITICAL
-# logger.setLevel(logging.DEBUG)
-# # Handler that writes log messages to the notebook's output
-# handler = logging.StreamHandler()
-# # Set the format for the log messages
-# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# handler.setFormatter(formatter)
-# # Add the handler to the logger
-# logger.addHandler(handler)
-logger.setLevel(logging.WARNING)  # Changed from DEBUG to reduce overhead during training
+logger.setLevel(logging.WARNING)
 
 
-class PALMIntermediate(nn.Module):
+class SwiGLU(nn.Module):
+    """
+    SwiGLU (Swish-Gated Linear Unit) MLP block.
+    
+    Used by Llama, Mistral, PaLM 2, and other modern LLMs.
+    Provides better learning capacity than standard GELU MLP for same parameter count.
+    
+    Architecture: down_proj(SiLU(gate_proj(x)) * up_proj(x))
+    """
     def __init__(self, config):
         super().__init__()
-        # Linear layer to project hidden states to a larger intermediate size
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        # Activation function (GELU) to introduce non-linearity
-        self.intermediate_act_fn = nn.GELU()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        
+        # Gate and up projections (both to intermediate size)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        
+        # Down projection back to hidden size
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        
+        # Dropout for regularization
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states):
-        # Apply linear transformation and activation function to the hidden states
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states
-    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SwiGLU: SiLU(gate) * up, then project down
+        gate = F.silu(self.gate_proj(x))
+        up = self.up_proj(x)
+        hidden = gate * up
+        output = self.down_proj(hidden)
+        output = self.dropout(output)
+        return output
 
-class PALMOutput(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Linear layer to project the intermediate representation back to the original hidden size
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        
-        # Layer normalization for stability and improved training
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-        # Dropout layer for regularization to prevent overfitting
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states, input_tensor):
-        # Apply linear transformation and dropout to the hidden states
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-
-        # Add input tensor to the transformed hidden states (residual connection) and normalize
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
-    
 
 class PALMLayer(nn.Module):
+    """
+    Single PALM transformer layer with Pre-Normalization architecture.
+    
+    Pre-Norm pattern (modern standard):
+        x = x + Attention(Norm(x))
+        x = x + PartialAttention(Norm(x))
+        x = x + MLP(Norm(x))
+    
+    This provides better gradient flow and training stability at scale.
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        # Attention mechanism
+        # Pre-normalization layers (RMSNorm for efficiency)
+        self.attn_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.partial_attn_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # Attention mechanism with RoPE
         self.attention = PALMAttention(config)
 
         # Partial attention mechanism for handling source input sequences
         self.partial_attention = PALMPartialAttention(config)
 
-        # Intermediate layer for processing the attention output
-        self.intermediate = PALMIntermediate(config)
+        # SwiGLU MLP (modern standard)
+        self.mlp = SwiGLU(config)
 
-        # Output layer to produce the final output for this layer
-        self.output = PALMOutput(config)
-
-    def forward(self, hidden_states, attention_mask=None, source_len=None,
-                past_key_value=None, use_cache=False):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        source_len: Optional[int] = None,
+        past_key_value: Optional[Tuple] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
         """
         Args:
             hidden_states: Input tensor
             attention_mask: Attention mask in additive form
-            source_len: Length of source sequence (int or tensor) for extracting source from attention output
+            position_ids: Position IDs for RoPE with SPE
+            source_len: Length of source sequence for extracting source from attention output
             past_key_value: Tuple of ((attn_key, attn_value), (partial_key, partial_value))
             use_cache: Whether to return key/values for caching
         
         Returns:
             layer_output: Output tensor
             present_key_value: Tuple of caches if use_cache=True, else None
-        
-        Note: Paper refines source representations through each layer. We extract
-              source_hidden_states from attention_output[:, :source_len] INSIDE each layer,
-              not from static embeddings passed through the network.
         """
         # Unpack past key values if provided
         past_attn_kv = None
@@ -108,53 +111,85 @@ class PALMLayer(nn.Module):
         if past_key_value is not None:
             past_attn_kv, past_partial_kv = past_key_value
         
-        # Apply attention mechanism with caching
+        # ============ Self-Attention Block (Pre-Norm) ============
+        residual = hidden_states
+        hidden_states = self.attn_norm(hidden_states)
+        
         attention_output, present_attn_kv = self.attention(
-            hidden_states, attention_mask, 
-            past_key_value=past_attn_kv, use_cache=use_cache
+            hidden_states, 
+            attention_mask, 
+            position_ids=position_ids,
+            past_key_value=past_attn_kv, 
+            use_cache=use_cache
         )
+        hidden_states = residual + attention_output
 
-        # Paper: Extract source_hidden_states from THIS LAYER's attention output
-        # This allows source representations to be progressively refined through layers
-        # rather than using static embeddings
+        # Extract source_hidden_states from THIS LAYER's output for partial attention
         source_hidden_states = None
+        source_position_ids = None
         if past_partial_kv is None:
-            # First forward pass or no caching: extract source from attention output
             if source_len is None:
                 source_len = self.config.fixed_source_length
             if isinstance(source_len, torch.Tensor):
                 max_source_len = int(source_len.max().item())
             else:
                 max_source_len = int(source_len)
-            max_source_len = min(max_source_len, attention_output.size(1))
-            source_hidden_states = attention_output[:, :max_source_len]
-        # If past_partial_kv is provided, source K/V are already cached
+            max_source_len = min(max_source_len, hidden_states.size(1))
+            source_hidden_states = hidden_states[:, :max_source_len]
+            
+            # Source positions for partial attention: 0, 1, 2, ..., source_len-1
+            if position_ids is not None:
+                source_position_ids = position_ids[:, :max_source_len]
+        
+        # ============ Partial Attention Block (Pre-Norm) ============
+        residual = hidden_states
+        hidden_states = self.partial_attn_norm(hidden_states)
         
         partial_attention_output, present_partial_kv = self.partial_attention(
-            attention_output,
-            source_hidden_states,  # Can be None if past_partial_kv is provided
+            hidden_states,
+            source_hidden_states,
             attention_mask,
+            position_ids=position_ids,
+            source_position_ids=source_position_ids,
             past_key_value=past_partial_kv,
             use_cache=use_cache
         )
+        hidden_states = residual + partial_attention_output
         
         # Pack present key values
         present_key_value = None
         if use_cache:
             present_key_value = (present_attn_kv, present_partial_kv)
         
-        # Process output of the partial attention with the intermediate layer
-        intermediate_output = self.intermediate(partial_attention_output)
-        layer_output = self.output(intermediate_output, partial_attention_output)
-        return layer_output, present_key_value
+        # ============ MLP Block (Pre-Norm) ============
+        residual = hidden_states
+        hidden_states = self.mlp_norm(hidden_states)
+        mlp_output = self.mlp(hidden_states)
+        hidden_states = residual + mlp_output
+        
+        return hidden_states, present_key_value
     
 
 class PALMModel(nn.Module):
+    """
+    Partial Attention Language Model (PALM) with modern architecture.
+    
+    Key architectural features:
+    - RoPE (Rotary Position Embeddings): Preserves pretrained positional understanding
+    - SPE (Separate Positional Encoding): Resets positions at source→target boundary
+    - Tied SAE head: sae_head shares weights with lm_head for stronger coupling
+    - GQA (Grouped Query Attention): Memory-efficient attention with reduced KV heads
+    - Pre-Normalization: Better gradient flow and training stability
+    - RMSNorm: Faster than LayerNorm with similar stability
+    - SwiGLU: Better MLP capacity than GELU
+    - SDPA: Efficient attention (FlashAttention when available)
+    """
+    
     # HuggingFace/PEFT compatibility attributes
     _supports_cache_class = False
     supports_gradient_checkpointing = True
-    _supports_sdpa = False
-    _supports_flash_attn_2 = False
+    _supports_sdpa = True  # Now supports SDPA!
+    _supports_flash_attn_2 = True  # Via SDPA backend selection
     
     def __init__(self, config):
         super().__init__()
@@ -163,27 +198,36 @@ class PALMModel(nn.Module):
         # Gradient checkpointing for memory efficiency
         self.gradient_checkpointing = getattr(config, 'gradient_checkpointing', False)
 
-        # Embedding layer for input tokens
+        # Embedding layer (word + language embeddings, NO positional - RoPE handles that)
         self.embeddings = PALMEmbeddings(config)
 
-        # Stack of transformer layers
+        # Stack of transformer layers with RoPE
         self.layers = nn.ModuleList([PALMLayer(config) for _ in range(config.num_hidden_layers)])
         
-        # Linear layers for language modeling, source autoencoding heads
+        # Final RMSNorm before lm_head (required for Pre-Norm architecture)
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
+        # Language modeling head
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
-        # Linear layer for sequence autoencoding head
-        self.sae_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # SAE head: TIED to lm_head weights for stronger SAE↔generation coupling
+        # This prevents the "escape valve" problem where SAE learns through a separate path
+        # Both heads now share the same learned token embeddings
+        self._tie_sae_head = getattr(config, 'tie_sae_head', True)
+        if self._tie_sae_head:
+            # Create a reference (no separate weights - they share lm_head.weight)
+            self.sae_head = None  # Will use lm_head directly
+        else:
+            # Fallback: separate SAE head (original behavior)
+            self.sae_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
         # Weight for combining SAE loss
-        self.sae_weight = config.sae_weight if hasattr(config, 'sae_weight') else 0.5  # Weight for SAE loss
+        self.sae_weight = config.sae_weight if hasattr(config, 'sae_weight') else 0.5
         
         # Logit softcapping to prevent numerical instability (Gemma 2 style)
-        # Bounds logits to [-softcap, softcap] using tanh. 0 = disabled.
         self.logit_softcap = getattr(config, 'logit_softcap', 0.0)
         
         # Generation config for PEFT/HuggingFace compatibility
-        # This is required when PEFT wraps the model for generation
         self.generation_config = GenerationConfig(
             max_length=getattr(config, 'max_length', 512),
             max_new_tokens=None,
@@ -197,20 +241,16 @@ class PALMModel(nn.Module):
             eos_token_id=getattr(config, 'eos_token_id', None),
             bos_token_id=getattr(config, 'bos_token_id', None),
         )
+    
+    def get_sae_head(self) -> nn.Linear:
+        """Get the SAE head (tied to lm_head or separate)."""
+        if self._tie_sae_head:
+            return self.lm_head  # Use lm_head for SAE (tied weights)
+        return self.sae_head
 
     def create_bidirectional_attention_mask(self, input_ids, source_len=None):
         """
         Create attention mask with per-sample source lengths.
-        
-        Args:
-            input_ids: [batch_size, seq_length]
-            source_len: tensor of shape [batch_size] with per-sample source lengths,
-                       OR an integer for uniform source length across batch,
-                       OR None to use config.fixed_source_length
-        
-        Returns:
-            mask: [batch_size, 1, seq_length, seq_length] in additive form
-                  (0 = attend, -10000 = mask)
         
         Mask structure per sample:
             - Source tokens (0 to source_len-1): bidirectional attention
@@ -219,60 +259,55 @@ class PALMModel(nn.Module):
         batch_size, seq_length = input_ids.size()
         device = input_ids.device
         
-        # Handle source_len argument
         if source_len is None:
             source_len = self.config.fixed_source_length
         
-        # Convert source_len to tensor if it's an integer
         if isinstance(source_len, int):
             source_len = torch.full((batch_size,), source_len, dtype=torch.long, device=device)
         else:
             source_len = source_len.to(device)
-            # Clamp source_len to not exceed seq_length
             source_len = torch.clamp(source_len, max=seq_length)
         
-        # Create position indices [1, seq_length]
         pos = torch.arange(seq_length, device=device).unsqueeze(0)
-        
-        # Expand source_len to [batch_size, 1] for broadcasting
         source_len_expanded = source_len.unsqueeze(1)
+        is_source = pos < source_len_expanded
         
-        # Create masks for source and target regions
-        # is_source[b, i] = True if position i is in source region for sample b
-        is_source = pos < source_len_expanded  # [batch_size, seq_length]
-        
-        # Create causal mask
         causal = torch.tril(torch.ones((seq_length, seq_length), device=device, dtype=torch.bool))
         causal = causal.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Build attention pattern
-        is_source_query = is_source.unsqueeze(2)  # [batch_size, seq_length, 1]
-        is_source_key = is_source.unsqueeze(1)    # [batch_size, 1, seq_length]
+        is_source_query = is_source.unsqueeze(2)
+        is_source_key = is_source.unsqueeze(1)
         
-        # Source tokens can attend to all source tokens (bidirectional)
         source_to_source = is_source_query & is_source_key
-        
-        # Target tokens can attend to source tokens
         is_target_query = ~is_source_query
         target_to_source = is_target_query & is_source_key
-        
-        # Target tokens use causal attention for target-to-target
         target_to_target = is_target_query & (~is_source_key) & causal
         
-        # Combine all attention patterns
         attend_mask = source_to_source | target_to_source | target_to_target
         
-        # Convert to additive mask format
         mask = attend_mask.unsqueeze(1).float()
         mask = (1.0 - mask) * -10000.0
         
         return mask
 
-    def forward(self, input_ids=None, attention_mask=None, labels=None, source_len=None,
-                past_key_values=None, use_cache=False, position_offset=None,
-                inputs_embeds=None, output_attentions=None, output_hidden_states=None,
-                return_dict=None, **kwargs):
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        source_len: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple]] = None,
+        use_cache: bool = False,
+        position_offset: Optional[int] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ):
         """
+        Forward pass with RoPE and tied SAE head.
+        
         Args:
             input_ids: Input token IDs [batch_size, seq_length]
             attention_mask: Attention mask (2D padding or 4D full mask)
@@ -280,12 +315,9 @@ class PALMModel(nn.Module):
             source_len: Per-sample source lengths [batch_size] for mask creation and SAE loss
             past_key_values: List of past key/value tuples for each layer
             use_cache: Whether to return key/values for caching
-            position_offset: Position offset for incremental decoding (for embeddings)
+            position_offset: Position offset for incremental decoding
             inputs_embeds: Pre-computed embeddings (alternative to input_ids, used by PEFT)
-            output_attentions: Not used, for HuggingFace compatibility
-            output_hidden_states: Not used, for HuggingFace compatibility
-            return_dict: Not used, for HuggingFace compatibility
-            **kwargs: Additional arguments for compatibility
+            **kwargs: Additional arguments for HuggingFace compatibility
         
         Returns:
             lm_logits, combined_loss, loss, sae_loss[, past_key_values]
@@ -295,11 +327,11 @@ class PALMModel(nn.Module):
             if inputs_embeds is not None:
                 batch_size, seq_length, _ = inputs_embeds.shape
                 device = inputs_embeds.device
-                # If input_ids not provided but we need them for labels/SAE, this will fail gracefully
                 if input_ids is None:
                     input_ids = torch.zeros((batch_size, seq_length), dtype=torch.long, device=device)
+                # Need to compute position_ids even with pre-computed embeddings
+                position_ids = None
             else:
-                # Ensure input_ids is a tensor and has the correct dimensions
                 input_ids = torch.tensor(input_ids) if not isinstance(input_ids, torch.Tensor) else input_ids
                 if input_ids.dim() == 1:
                     input_ids = input_ids.unsqueeze(0)
@@ -309,8 +341,7 @@ class PALMModel(nn.Module):
             # Track if source_len was explicitly provided (for SAE loss computation)
             source_len_provided = source_len is not None
             
-            # Handle source_len - default to fixed_source_length if not provided
-            # (needed for attention mask creation, but SAE loss only computed if explicitly provided)
+            # Handle source_len
             if source_len is None:
                 source_len = torch.full(
                     (batch_size,), 
@@ -323,7 +354,7 @@ class PALMModel(nn.Module):
             else:
                 source_len = source_len.to(device)
             
-            # Determine position offset for embeddings
+            # Position offset for incremental decoding
             if position_offset is None:
                 position_offset = 0
             
@@ -337,7 +368,7 @@ class PALMModel(nn.Module):
                     padding_mask = attention_mask
                     attention_mask = None
             
-            # Create the bidirectional attention mask with per-sample source_len
+            # Create the bidirectional attention mask
             if attention_mask is None:
                 attention_mask = self.create_bidirectional_attention_mask(input_ids, source_len)
                 
@@ -346,44 +377,50 @@ class PALMModel(nn.Module):
                     padding_mask_additive = (1.0 - expanded_padding_mask.float()) * -10000.0
                     attention_mask = attention_mask + padding_mask_additive
     
-            # Ensure labels are tensors and have the correct dimensions
+            # Ensure labels are tensors
             if labels is not None:
                 labels = torch.tensor(labels) if not isinstance(labels, torch.Tensor) else labels
                 if labels.dim() == 1:
                     labels = labels.unsqueeze(0)
     
-            # Embedding lookup with position offset (or use pre-computed inputs_embeds)
+            # Embedding lookup with position IDs for RoPE
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+                # Compute position_ids for RoPE even with pre-computed embeddings
+                _, position_ids = self.embeddings(input_ids, source_len=source_len, position_offset=position_offset)
             else:
-                hidden_states = self.embeddings(input_ids, source_len=source_len, position_offset=position_offset)
+                hidden_states, position_ids = self.embeddings(
+                    input_ids, source_len=source_len, position_offset=position_offset
+                )
             
-            # Calculate max source length for layers (each layer extracts source from its attention output)
+            # Calculate max source length for layers
             max_source_len = min(source_len.max().item(), seq_length)
             max_source_len = int(max_source_len)
     
             # Initialize present key values list
             present_key_values = [] if use_cache else None
     
-            # Pass through each layer with caching
-            # Note: Each layer extracts source_hidden_states from its own attention output
-            # This allows source representations to be progressively refined (paper design)
+            # Pass through each layer with RoPE position_ids
             for i, layer in enumerate(self.layers):
                 layer_past_kv = past_key_values[i] if past_key_values is not None else None
                 
-                # Use gradient checkpointing if enabled and training (saves memory)
+                # Use gradient checkpointing if enabled and training
                 if self.gradient_checkpointing and self.training and not use_cache:
-                    # Gradient checkpointing wrapper - recomputes activations during backward
-                    def create_custom_forward(module, src_len):
+                    def create_custom_forward(module, src_len, pos_ids):
                         def custom_forward(hidden_states, attention_mask):
-                            outputs = module(hidden_states, attention_mask, 
-                                           source_len=src_len,
-                                           past_key_value=None, use_cache=False)
-                            return outputs[0]  # Only return hidden_states
+                            outputs = module(
+                                hidden_states, 
+                                attention_mask,
+                                position_ids=pos_ids,
+                                source_len=src_len,
+                                past_key_value=None, 
+                                use_cache=False
+                            )
+                            return outputs[0]
                         return custom_forward
                     
                     hidden_states = gradient_checkpoint(
-                        create_custom_forward(layer, max_source_len),
+                        create_custom_forward(layer, max_source_len, position_ids),
                         hidden_states,
                         attention_mask,
                         use_reentrant=False
@@ -393,6 +430,7 @@ class PALMModel(nn.Module):
                     hidden_states, present_kv = layer(
                         hidden_states, 
                         attention_mask,
+                        position_ids=position_ids,
                         source_len=max_source_len if past_key_values is None else None,
                         past_key_value=layer_past_kv,
                         use_cache=use_cache
@@ -400,12 +438,14 @@ class PALMModel(nn.Module):
                 
                 if use_cache:
                     present_key_values.append(present_kv)
+            
+            # Apply final normalization (required for Pre-Norm architecture)
+            hidden_states = self.final_norm(hidden_states)
     
             # Compute logits for language modeling
             lm_logits = self.lm_head(hidden_states)
             
-            # Apply logit softcapping if enabled (Gemma 2 style)
-            # Bounds logits to [-softcap, softcap] to prevent numerical instability
+            # Apply logit softcapping if enabled
             if self.logit_softcap > 0:
                 lm_logits = self.logit_softcap * torch.tanh(lm_logits / self.logit_softcap)
 
@@ -416,17 +456,17 @@ class PALMModel(nn.Module):
             
             # Compute loss if labels are provided
             if labels is not None:
-                # Use ignore_index=-100 to exclude masked tokens (prompt + padding) from loss
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                 loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
 
                 # Calculate SAE loss only if source_len was explicitly provided
                 if source_len_provided:
-                    # Compute SAE logits only for source portion
                     max_source_len = min(source_len.max().item(), hidden_states.size(1))
                     max_source_len = int(max_source_len)
                     
-                    sae_logits = self.sae_head(hidden_states[:, :max_source_len])
+                    # Use tied SAE head (same as lm_head)
+                    sae_head = self.get_sae_head()
+                    sae_logits = sae_head(hidden_states[:, :max_source_len])
                     
                     # Apply softcapping to SAE logits as well
                     if self.logit_softcap > 0:
@@ -434,8 +474,7 @@ class PALMModel(nn.Module):
                     
                     sae_labels = input_ids[:, :max_source_len].clone()
                     
-                    # Mask out positions beyond each sample's actual source_len with -100
-                    # Vectorized version for efficiency
+                    # Mask out positions beyond each sample's actual source_len
                     range_tensor = torch.arange(max_source_len, device=device).unsqueeze(0)
                     source_mask = range_tensor >= source_len.unsqueeze(1)
                     sae_labels[source_mask] = -100
@@ -445,11 +484,9 @@ class PALMModel(nn.Module):
                     # Combine losses
                     combined_loss = loss + self.sae_weight * sae_loss
                 else:
-                    # No SAE loss if source_len not provided (backward compatibility)
                     combined_loss = loss
                     sae_loss = torch.tensor(0.0, device=loss.device)
             
-            # Return with or without cache
             if use_cache:
                 return lm_logits, combined_loss, loss, sae_loss, present_key_values
             return lm_logits, combined_loss, loss, sae_loss   
@@ -461,58 +498,56 @@ class PALMModel(nn.Module):
                   f"labels: {labels.shape if isinstance(labels, torch.Tensor) else 'not a tensor'},")
             raise
 
-    def generate(self, input_ids, max_length=None, min_length=None, do_sample=True, 
-                 temperature=1.0, top_k=50, top_p=1.0, repetition_penalty=1.0, 
-                 pad_token_id=None, eos_token_id=None, attention_mask=None, 
-                 use_cache=True, **kwargs):
-        """
-        Generate text with optional KV caching for faster inference.
-        
-        Args:
-            use_cache: If True, use KV caching for faster generation (default: True)
-        """
-        # Set default values for generation parameters
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_length: Optional[int] = None,
+        min_length: Optional[int] = None,
+        do_sample: bool = True,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Generate text with optional KV caching."""
         max_length = max_length if max_length is not None else getattr(self.config, 'max_length', 512)
         min_length = min_length if min_length is not None else getattr(self.config, 'min_length', 1)
         pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.config.eos_token_id
 
-        # Ensure input_ids are on the correct device
         device = next(self.parameters()).device
         input_ids = input_ids.to(device, non_blocking=True)
 
-        # IMPORTANT: Store the original source length (the prompt length)
+        # Store the original source length (the prompt length)
         original_source_length = input_ids.shape[1]
         
-        # Temporarily override fixed_source_length for this generation
+        # Temporarily override fixed_source_length
         saved_fixed_source_length = self.config.fixed_source_length
         self.config.fixed_source_length = original_source_length
         
-        # Initialize sequence tracking
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         generated_sequence = input_ids
         past_key_values = None
 
         try:
             while True:
-                # Determine what to pass to forward
                 if use_cache and past_key_values is not None:
-                    # Only pass the last token when using cache
                     model_input_ids = generated_sequence[:, -1:]
-                    # Position offset is the position of the new token
                     position_offset = generated_sequence.shape[1] - 1
-                    # Create attention mask for single new token attending to full sequence
                     full_seq_len = generated_sequence.shape[1]
                     attention_mask = self._create_incremental_attention_mask(
                         full_seq_len, original_source_length, device
                     )
                 else:
-                    # First step or no caching: pass full sequence
                     model_input_ids = generated_sequence
                     position_offset = 0
                     attention_mask = self.create_bidirectional_attention_mask(generated_sequence)
 
-                # Forward pass without gradients
                 with torch.no_grad():
                     outputs = self(
                         model_input_ids,
@@ -523,16 +558,13 @@ class PALMModel(nn.Module):
                         position_offset=position_offset
                     )
                 
-                # Get logits and optionally update cache
                 if use_cache:
                     lm_logits, _, _, _, past_key_values = outputs
                 else:
                     lm_logits = outputs[0]
                 
-                # Get the next token logits (last position)
                 next_token_logits = lm_logits[:, -1, :]
 
-                # Adjust logits for generation
                 next_token_logits = self.adjust_logits_during_generation(
                     next_token_logits,
                     cur_len=generated_sequence.shape[1],
@@ -542,68 +574,33 @@ class PALMModel(nn.Module):
                     input_ids=generated_sequence
                 )
 
-                # Apply temperature
                 next_token_logits = next_token_logits / temperature
-
-                # Apply top-k and top-p filtering
                 next_token_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
 
-                # Sample next token
                 if do_sample:
                     probs = F.softmax(next_token_logits, dim=-1)
                     next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
                 else:
                     next_tokens = torch.argmax(next_token_logits, dim=-1)
 
-                # Handle finished sequences
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-                # Update unfinished sequences
                 unfinished_sequences = unfinished_sequences.mul((next_tokens != eos_token_id).long())
-
-                # Append next tokens to the sequence
                 generated_sequence = torch.cat([generated_sequence, next_tokens.unsqueeze(-1)], dim=-1)
 
-                # Stop if we've reached max_length or all sequences are finished
                 if unfinished_sequences.max() == 0 or generated_sequence.shape[1] >= max_length:
                     break
         finally:
-            # Restore original fixed_source_length
             self.config.fixed_source_length = saved_fixed_source_length
 
         return generated_sequence
     
-    def _create_incremental_attention_mask(self, full_seq_len, source_length, device):
-        """
-        Create attention mask for a single new token attending to the full sequence.
-        
-        For incremental decoding, the new token can attend to:
-        - All source tokens (bidirectionally)
-        - All previous target tokens (causally - but they're all in the past)
-        - Itself
-        
-        Returns:
-            Attention mask of shape [1, 1, 1, full_seq_len] (0 = attend, -10000 = mask)
-        """
-        # The new token can attend to everything before it (including all source and generated tokens)
-        # So the mask is all zeros (attend to everything)
+    def _create_incremental_attention_mask(self, full_seq_len: int, source_length: int, device: torch.device):
+        """Create attention mask for incremental decoding."""
         mask = torch.zeros((1, 1, 1, full_seq_len), device=device)
         return mask
     
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **kwargs):
-        """
-        Prepare inputs for generation (required by PEFT/HuggingFace generation utilities).
-        
-        Args:
-            input_ids: Input token IDs [batch_size, seq_length]
-            past_key_values: Cached key/values from previous forward pass
-            attention_mask: Optional attention mask
-            **kwargs: Additional arguments (position_offset, use_cache, etc.)
-        
-        Returns:
-            Dictionary with model inputs
-        """
-        # If past_key_values exist, only use the last token
+        """Prepare inputs for generation (required by PEFT/HuggingFace)."""
         if past_key_values is not None:
             input_ids = input_ids[:, -1:]
         
@@ -615,11 +612,8 @@ class PALMModel(nn.Module):
         }
     
     def adjust_logits_during_generation(self, logits, cur_len, max_length, min_length, repetition_penalty, input_ids):
-        """Adjust token logits during generation. Optimized adjustment with vectorized operations."""
-        
-        # Apply repetition penalty
+        """Adjust token logits during generation."""
         if repetition_penalty != 1.0:
-            # Vectorized repetition penalty application
             unique_tokens = torch.unique(input_ids)
             logits.scatter_(
                 1,
@@ -630,18 +624,15 @@ class PALMModel(nn.Module):
                     logits.gather(1, unique_tokens.unsqueeze(0).expand(logits.size(0), -1)) / repetition_penalty
                 )
             )
-        # Prevent generation of tokens before min_length
         if cur_len < min_length:
             logits[:, self.config.eos_token_id] = float('-inf')
 
         return logits
     
     def top_k_top_p_filtering(self, logits, top_k=0, top_p=1.0, filter_value=-float("Inf"), min_tokens_to_keep=1):
-        """Filter a distribution of logits using top-k and/or top-p (nucleus) filtering."""
+        """Filter a distribution of logits using top-k and/or top-p filtering."""
         if top_k > 0:
-            top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))  # Safety check
-            
-            # Remove all tokens with a probability less than the last token of the top-k
+            top_k = min(max(top_k, min_tokens_to_keep), logits.size(-1))
             topk_values, _ = torch.topk(logits, top_k)
             indices_to_remove = logits < topk_values[..., -1, None]
             logits.masked_fill_(indices_to_remove, filter_value)
@@ -649,15 +640,9 @@ class PALMModel(nn.Module):
         if top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-            # Remove tokens with cumulative probability above the threshold (token with 0 are kept)
             sorted_indices_to_remove = cumulative_probs > top_p
-            
-            # Shift indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
-
-            # Scatter sorted tensors to original indexing
             indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
             indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
             logits.masked_fill_(indices_to_remove, filter_value)
@@ -665,11 +650,11 @@ class PALMModel(nn.Module):
         return logits
     
     def save_pretrained(
-        self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, push_to_hub=False, 
-        max_shard_size="5GB", safe_serialization=True, variant=None, token=None, save_peft_format=True, **kwargs):
-            
-        """Save a model and its configuration file to a directory, so that it can be re-loaded using the 
-        `from_pretrained` class method."""
+        self, save_directory, is_main_process=True, state_dict=None, save_function=torch.save, 
+        push_to_hub=False, max_shard_size="5GB", safe_serialization=True, variant=None, 
+        token=None, save_peft_format=True, **kwargs
+    ):
+        """Save model and configuration."""
         if not is_main_process:
             return None
 
@@ -678,21 +663,17 @@ class PALMModel(nn.Module):
 
         os.makedirs(save_directory, exist_ok=True)
 
-        # Validate configuration
         if not hasattr(self, 'config'):
             raise AttributeError("Model doesn't have a config attribute")
 
-        # Efficient state dict handling
         state_dict = state_dict or (
             self.module.state_dict() if hasattr(self, 'module') else self.state_dict()
         )
         
-        # Set up LFS tracking for large files
         with open(os.path.join(save_directory, '.gitattributes'), 'w') as f:
             f.write('*.bin filter=lfs diff=lfs merge=lfs -text\n')
             f.write('*.safetensors filter=lfs diff=lfs merge=lfs -text\n')
         
-        # Optimize file saving with sharding support
         if safe_serialization:
             from safetensors.torch import save_file
             save_file(
@@ -706,16 +687,13 @@ class PALMModel(nn.Module):
                 os.path.join(save_directory, 'pytorch_model.bin')
             )
 
-        # Save model config if available
         model_to_save = self.module if hasattr(self, 'module') else self
         if hasattr(model_to_save, 'config'):
             model_to_save.config.save_pretrained(save_directory)
 
-       # Save tokenizer if available
         if hasattr(self, 'tokenizer'):
             self.tokenizer.save_pretrained(save_directory)
         
-        # Handle hub pushing with metadata
         if push_to_hub and hasattr(self, '_push_to_hub'):
             commit_message = kwargs.pop("commit_message", "Upload model")
             private = kwargs.pop("private", False)
@@ -744,7 +722,7 @@ class PALMModel(nn.Module):
        
     @staticmethod
     def _load_config(path):
-        """Helper method for efficient config loading."""
+        """Helper method for config loading."""
         from ..config import PALMConfig
         config_file = os.path.join(path, "config.json")
         if not os.path.exists(config_file):
@@ -753,7 +731,7 @@ class PALMModel(nn.Module):
        
     @staticmethod
     def _find_and_load_state_dict(path):
-        """Helper method for efficient state dict loading."""
+        """Helper method for state dict loading."""
         file_types = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.ckpt"]
         for pattern in file_types:
             files = glob.glob(os.path.join(path, pattern))

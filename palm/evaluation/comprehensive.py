@@ -308,7 +308,9 @@ def compute_mask_compliance(
     
     seq_len = input_ids.size(1)
     attention_mask = model.create_bidirectional_attention_mask(input_ids)
-    hidden_states = model.embeddings(input_ids)
+    # PALMEmbeddings returns (embeddings, position_ids) for RoPE-compatible models
+    emb_out = model.embeddings(input_ids)
+    hidden_states = emb_out[0] if isinstance(emb_out, (tuple, list)) else emb_out
     
     future_leakages = []
     source_masses = []
