@@ -19,21 +19,53 @@ logger = logging.getLogger(__name__)
 # logger.addHandler(handler)
 logger.setLevel(logging.WARNING)  # Changed from DEBUG to reduce overhead during training
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Repeat KV heads to match query heads for GQA.
+    
+    Args:
+        hidden_states: (batch, num_kv_heads, seq_len, head_dim)
+        n_rep: Number of times to repeat each KV head
+    
+    Returns:
+        Tensor of shape (batch, num_kv_heads * n_rep, seq_len, head_dim)
+    """
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+# Set logger level (DEBUG for development, WARNING for training)
+logger.setLevel(logging.WARNING)
+
 
 class PALMAttention(nn.Module):
+    """
+    Self-Attention with Group Query Attention (GQA) support.
+    
+    GQA reduces the number of key/value heads while keeping all query heads,
+    significantly reducing KV cache memory during inference with minimal quality loss.
+    """
     def __init__(self, config):
         super().__init__()
-        self.num_attention_heads = config.num_attention_heads # Number of attention heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads) # Size per attention head
-        self.all_head_size = self.num_attention_heads * self.attention_head_size # Total size for all attention heads
+        self.num_attention_heads = config.num_attention_heads  # Query heads
+        self.num_kv_heads = getattr(config, 'num_kv_heads', config.num_attention_heads)  # KV heads (GQA)
+        self.num_kv_groups = self.num_attention_heads // self.num_kv_heads  # How many times to repeat KV
+        
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)  # Size per head
+        self.all_head_size = self.num_attention_heads * self.attention_head_size  # Total Q size
+        self.kv_head_size = self.num_kv_heads * self.attention_head_size  # Total KV size (smaller with GQA)
 
         # Pre-attention layer norm
         self.pre_attention_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
-        # Linear layers to project hidden states into query, key, and value representations
+        # Query projection: full num_attention_heads
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        # Key/Value projections: reduced num_kv_heads (GQA)
+        self.key = nn.Linear(config.hidden_size, self.kv_head_size)
+        self.value = nn.Linear(config.hidden_size, self.kv_head_size)
 
         # Initialize attention projection with proper scaling
         nn.init.normal_(self.query.weight, mean=0.0, std=0.02/math.sqrt(2 * config.num_hidden_layers))
@@ -50,11 +82,11 @@ class PALMAttention(nn.Module):
         # Scale factor for attention scores
         self.attention_scale = math.sqrt(self.attention_head_size)
 
-    def transpose_for_scores(self, x):
-        # Reshape input tensor for multi-head attention and permute dimensions
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+    def transpose_for_scores(self, x, num_heads):
+        """Reshape for multi-head attention: (batch, seq, hidden) -> (batch, heads, seq, head_dim)"""
+        new_x_shape = x.size()[:-1] + (num_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3) # Permute dimensions to (batch, heads, seq_len, head_size)
+        return x.permute(0, 2, 1, 3)
 
 
     def forward(self, hidden_states, attention_mask=None, past_key_value=None, use_cache=False):
@@ -72,10 +104,10 @@ class PALMAttention(nn.Module):
         try:
             logger.debug(f"Hidden states shape: {hidden_states.shape}")
             
-            # Compute Q, K, V for current input
-            query_layer = self.transpose_for_scores(self.query(hidden_states))
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
+            # Compute Q (full heads), K, V (potentially fewer heads with GQA) for current input
+            query_layer = self.transpose_for_scores(self.query(hidden_states), self.num_attention_heads)
+            key_layer = self.transpose_for_scores(self.key(hidden_states), self.num_kv_heads)
+            value_layer = self.transpose_for_scores(self.value(hidden_states), self.num_kv_heads)
     
             # If we have cached key/values, concatenate with current
             if past_key_value is not None:
@@ -83,15 +115,19 @@ class PALMAttention(nn.Module):
                 key_layer = torch.cat([past_key, key_layer], dim=2)
                 value_layer = torch.cat([past_value, value_layer], dim=2)
             
-            # Store for caching if requested
+            # Store for caching if requested (cache the smaller KV)
             present_key_value = (key_layer, value_layer) if use_cache else None
     
             logger.debug(f"Query layer shape: {query_layer.shape}")
             logger.debug(f"Key layer shape: {key_layer.shape}")
             logger.debug(f"Value layer shape: {value_layer.shape}")
     
+            # GQA: Repeat KV heads to match query heads
+            key_layer_expanded = repeat_kv(key_layer, self.num_kv_groups)
+            value_layer_expanded = repeat_kv(value_layer, self.num_kv_groups)
+    
             # Calculate attention scores
-            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+            attention_scores = torch.matmul(query_layer, key_layer_expanded.transpose(-1, -2))
             attention_scores = attention_scores / math.sqrt(self.attention_head_size)
     
             logger.debug(f"Attention scores shape: {attention_scores.shape}")
@@ -119,7 +155,7 @@ class PALMAttention(nn.Module):
             attention_probs = self.dropout(attention_probs)
 
             # Compute context layer
-            context_layer = torch.matmul(attention_probs, value_layer)
+            context_layer = torch.matmul(attention_probs, value_layer_expanded)
             
             logger.debug(f"Context layer shape before permute: {context_layer.shape}")
             context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
@@ -161,35 +197,49 @@ class PALMAttention(nn.Module):
 
 
 class PALMPartialAttention(nn.Module):
+    """
+    Partial Attention with Group Query Attention (GQA) support.
+    
+    GQA reduces the number of key/value heads while keeping all query heads,
+    significantly reducing KV cache memory during inference with minimal quality loss.
+    
+    When num_kv_heads < num_attention_heads:
+    - Queries: num_attention_heads heads (full expressiveness)
+    - Keys/Values: num_kv_heads heads (repeated to match queries)
+    - KV cache shrinks by factor of (num_attention_heads / num_kv_heads)
+    """
     def __init__(self, config):
         super().__init__()
-        self.num_attention_heads = config.num_attention_heads # Number of attention heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads) # Size per attention head
-        self.all_head_size = self.num_attention_heads * self.attention_head_size # Total size for all attention heads
+        self.num_attention_heads = config.num_attention_heads  # Query heads
+        self.num_kv_heads = getattr(config, 'num_kv_heads', config.num_attention_heads)  # KV heads (GQA)
+        self.num_kv_groups = self.num_attention_heads // self.num_kv_heads  # How many times to repeat KV
+        
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)  # Size per head
+        self.all_head_size = self.num_attention_heads * self.attention_head_size  # Total Q size
+        self.kv_head_size = self.num_kv_heads * self.attention_head_size  # Total KV size (smaller with GQA)
 
-        # Linear layers to project hidden states into query, key, and value representations
+        # Query projection: full num_attention_heads
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        # Key/Value projections: reduced num_kv_heads (GQA)
+        self.key = nn.Linear(config.hidden_size, self.kv_head_size)
+        self.value = nn.Linear(config.hidden_size, self.kv_head_size)
 
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob) # Dropout layer for regularization
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size) # Linear layer for output of the attention mechanism
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps) # Layer normalization for stability and improved training
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # MLP applied to the source states (Fp network from paper)
         # Paper uses Pl = Pl2 + Pl1 (residual connection after two linear layers)
         self.Fp_linear1 = nn.Linear(config.hidden_size, config.hidden_size)
         self.Fp_activation = nn.ReLU()
-        # self.Fp_activation = nn.Tanh()  # Paper uses tanh - uncomment to try tanh vs ReLU
         self.Fp_dropout1 = nn.Dropout(config.hidden_dropout_prob)
         self.Fp_linear2 = nn.Linear(config.hidden_size, config.hidden_size)
         self.Fp_dropout2 = nn.Dropout(config.hidden_dropout_prob)
 
-    def transpose_for_scores(self, x):
-        # Reshape input tensor for multi-head attention and permute dimensions, (batch, seq, hidden) -> (batch, heads, seq, head_dim)
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+    def transpose_for_scores(self, x, num_heads):
+        """Reshape for multi-head attention: (batch, seq, hidden) -> (batch, heads, seq, head_dim)"""
+        new_x_shape = x.size()[:-1] + (num_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
-        # Permute dimensions to (batch, heads, seq_len, head_size)
         return x.permute(0, 2, 1, 3)
 
     def forward(self, hidden_states, source_states, attention_mask=None, past_key_value=None, use_cache=False):
@@ -207,7 +257,7 @@ class PALMPartialAttention(nn.Module):
         """
         # For partial attention, source K/V can be cached and reused since source doesn't change
         if past_key_value is not None:
-            # Reuse cached source K/V
+            # Reuse cached source K/V (already in num_kv_heads format)
             key_layer, value_layer = past_key_value
         else:
             # Compute K/V from source states through Fp network
@@ -218,17 +268,22 @@ class PALMPartialAttention(nn.Module):
             Pl2 = self.Fp_linear2(Pl1)
             Pl2 = self.Fp_dropout2(Pl2)
             P = Pl2 + Pl1  # Residual connection as per paper
-            key_layer = self.transpose_for_scores(self.key(P))
-            value_layer = self.transpose_for_scores(self.value(P))
+            # Project to num_kv_heads (not num_attention_heads) for GQA
+            key_layer = self.transpose_for_scores(self.key(P), self.num_kv_heads)
+            value_layer = self.transpose_for_scores(self.value(P), self.num_kv_heads)
         
-        # Store for caching if requested
+        # Store for caching if requested (cache the smaller KV)
         present_key_value = (key_layer, value_layer) if use_cache else None
     
-        # Compute query matrix from full hidden states (always recomputed)
-        query_layer = self.transpose_for_scores(self.query(hidden_states))
+        # Compute query matrix from full hidden states (always recomputed, full heads)
+        query_layer = self.transpose_for_scores(self.query(hidden_states), self.num_attention_heads)
+
+        # GQA: Repeat KV heads to match query heads
+        key_layer_expanded = repeat_kv(key_layer, self.num_kv_groups)
+        value_layer_expanded = repeat_kv(value_layer, self.num_kv_groups)
 
         # Calculate attention scores: (batch, heads, seq_len, source_len)
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attention_scores = torch.matmul(query_layer, key_layer_expanded.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
     
         # NOTE: Partial attention does NOT use the causal/bidirectional mask
@@ -239,7 +294,7 @@ class PALMPartialAttention(nn.Module):
         attention_probs = self.dropout(attention_probs)
     
         # Compute context layer
-        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = torch.matmul(attention_probs, value_layer_expanded)
         
         if context_layer.dim() != 4:
             context_layer = context_layer.view(hidden_states.size(0), -1, self.num_attention_heads, self.attention_head_size)

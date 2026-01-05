@@ -24,6 +24,7 @@ NUM_TRAIN_EPOCHS = 4
 HIDDEN_SIZE = 3072
 NUM_HIDDEN_LAYERS = 28
 NUM_ATTENTION_HEADS = 24
+NUM_KV_HEADS = 8  # GQA: 24 query heads / 8 KV heads = 3:1 ratio (matches Llama 3.2-3B)
 HIDDEN_DROPOUT_PROB = 0.42
 ATTN_DROPOUT_PROB = 0.25
 
@@ -36,6 +37,7 @@ CUSTOM_EPSILON = 1e-8
 SAE_WEIGHT = 0.45
 SAE_START_WEIGHT = 0.5
 SAE_END_WEIGHT = 0.3
+LOGIT_SOFTCAP = 30.0  # Bounds logits to [-30, 30] via tanh. Set to 0 to disable.
 
 MAX_SEQ_LENGTH = 1024 # The maximum sequence length for input data; longer sequences will be truncated
 LOG_EVERY_N_STEPS = 1

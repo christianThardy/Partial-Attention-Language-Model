@@ -8,48 +8,37 @@ In standard decoder-only transformers, this degradation is driven by how attenti
 
 This creates a stable channel for conditioning on prompt instructions, system constraints and retrieved documents. Improving source–target coherence and reducing attention degeneration during conditional text generation.
 
+## How it works
+
+<img width="2043" height="1006" alt="Image" src="https://github.com/user-attachments/assets/9c288884-cd5e-42e7-8c70-eac32c4a8386" />
+
 ## Overview
 
-PALM is an architectural wrapper around existing open-weight models (Llama, Qwen, Mistral, etc.). It transfers pretrained weights into a modified architecture that adds partial attention mechanisms while preserving the base model's learned representations.
+PALM operationalizes research that re-interprets decoder-only architectures as regularized encoder-decoders (Fu et al.). By treating the model as an architectural wrapper, PALM integrates partial attention mechanisms into existing open-weights (Llama, Mistral, Qwen, etc.) while preserving their fundamental learned representations.
 
 PALM enhances standard decoder-only models by introducing:
 
-- **Bidirectional attention over source tokens** - the prompt/context attends to itself fully, capturing richer contextual representations
-- **Partial attention mechanism** - a dedicated cross-attention-like module where all positions attend to the processed source embeddings
-- **Separate Positional Encoding (SPE)** - positions reset at the boundary between source and target to better delineate the two regions
-- **Language embeddings** - learned embeddings distinguish source (prompt) from target (generation)
-- **Source Auto-Encoding (SAE) auxiliary loss** - regularizes the model to reconstruct the source, encouraging faithful representations
+- **Bidirectional attention over source tokens** - The attention mask allows source tokens (think of this as the models context window or system prompt) to attend to each other bidirectionally (like an encoder), while target tokens attend causally to previous tokens and fully to all source tokens. 
 
-The approach is inspired by research interpreting decoder-only models as regularized encoder-decoders.
+  - **TLDR**; the prompt/context attends to itself fully, capturing richer contextual representations.
 
-## Architecture
+- **Partial attention mechanism** - Each layer applies an additional attention operation where query vectors from the full sequence attend to key/value vectors derived solely from the source portion, processed through a learned transformation (Fp network). This maintains a persistent connection to the original prompt throughout generation. 
 
-```
-Input Tokens
-     │
-     ▼
-┌─────────────────────────────────────┐
-│  PALMEmbeddings                     │
-│  word + position + language         │
-└─────────────────────────────────────┘
-     │
-     ▼
-┌─────────────────────────────────────┐
-│  PALMLayer (×N)                     │
-│  ├── Self-Attention (bidirectional  │
-│  │   for source, causal for target) │
-│  ├── Partial Attention (all tokens  │
-│  │   attend to transformed source)  │
-│  └── Feed-Forward Network           │
-└─────────────────────────────────────┘
-     │
-     ├─────────────────┐
-     ▼                 ▼
-┌──────────┐    ┌──────────┐
-│ LM Head  │    │ SAE Head │
-│ (target) │    │ (source) │
-└──────────┘    └──────────┘
-```
+  - **TLDR**; a dedicated cross-attention-like module where all positions attend to the processed source embeddings.
+
+- **Source Auto-Encoding (SAE) auxiliary loss** - The SAE head predicts the source tokens from their hidden representations, acting as a regularizer:
+   ```
+   combined_loss = lm_loss + λ * sae_loss
+   ```
+   The `sae_weight` (λ) hyperparameter controls the strength of this regularization. 
+   
+    - **TLDR**; regularizes the model to reconstruct the source, encouraging faithful representations
+
+- **Separate Positional Encoding (SPE)** - positions reset at the boundary between source and target to better delineate the two regions.
+
+- **Language embeddings** - learned embeddings distinguish source (prompt) from target (generation).
+
+---
 
 ## Start training in 10 Minutes
 
@@ -110,9 +99,14 @@ model = PALMModel(PALMConfig(base_model_name="Qwen/Qwen2.5-3B"))
 model = transfer_weights_to_palm(model, "Qwen/Qwen2.5-3B")
 ```
 
-**What transfers:** Self-attention projections (Q/K/V/O), MLP weights, embeddings, LM head; the bulk of the model.
+**What transfers:** Self-attention projections (Q, K, V, O), MLP weights, embeddings, LM head; the bulk of the model.
 
-**What's fresh:** The PALM-specific additions that get trained: partial attention layers, SAE head, language embeddings, Fp transformation.
+**What's fresh/bootstrapped:** Language and position embeddings are fresh. PALM-specific components are initialized from pretrained weights then fine-tuned:
+
+- partial attention Q, K, V, O ← cloned from self-attention
+- SAE head ← cloned from LM head
+- LayerNorms ← cloned from input norms
+- Fp network ← identity-like (residual-dominant)
 
 ### LoRA / QLoRA Fine-tuning
 
@@ -178,53 +172,6 @@ sweep_results = sweep.run(train_loader, eval_loader)
 ablation = SourceAblationEvaluator(model, tokenizer)
 ablation_results = ablation.evaluate(samples)
 ```
-
----
-
-## Key Concepts
-
-### Bidirectional Source Attention
-
-The attention mask allows source tokens to attend to each other bidirectionally (like an encoder), while target tokens attend causally to previous tokens and fully to all source tokens.
-
-### Partial Attention
-
-Each layer applies an additional attention operation where query vectors from the full sequence attend to key/value vectors derived solely from the source portion, processed through a learned transformation (Fp network). This maintains a persistent connection to the original prompt throughout generation.
-
-### Source Auto-Encoding Loss
-
-The SAE head predicts the source tokens from their hidden representations, acting as a regularizer:
-
-```
-combined_loss = lm_loss + λ * sae_loss
-```
-
-The `sae_weight` (λ) hyperparameter controls the strength of this regularization.
-
-## Configuration
-
-Key configuration parameters:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `base_model_name` | `meta-llama/Meta-Llama-3.1-8B-Instruct` | HuggingFace model to inherit config from |
-| `fixed_source_length` | 100 | Default source sequence length |
-| `sae_weight` | 0.5 | Weight for SAE loss in combined loss |
-| `hidden_size` | 4096 | Hidden dimension |
-| `num_hidden_layers` | 32 | Number of transformer layers |
-| `num_attention_heads` | 32 | Number of attention heads |
-| `learning_rate` | 5e-5 | Optimizer learning rate |
-| `gradient_accumulation_steps` | 10 | Steps before optimizer update |
-
-## What to Expect
-
-After training, you should see:
-
-- Combined loss decreasing (LM loss + SAE loss)
-- SAE loss staying low, indicating the model maintains source representations
-- If PALM is using the source, source ablation should measurably reduce output likelihood/quality vs baseline.
-
-The source ablation evaluator can quantify this: replacing/shuffling source tokens should significantly degrade output quality if the partial attention mechanism is working.
 
 ## Status
 

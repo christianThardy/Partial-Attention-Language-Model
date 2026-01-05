@@ -178,6 +178,10 @@ class PALMModel(nn.Module):
         # Weight for combining SAE loss
         self.sae_weight = config.sae_weight if hasattr(config, 'sae_weight') else 0.5  # Weight for SAE loss
         
+        # Logit softcapping to prevent numerical instability (Gemma 2 style)
+        # Bounds logits to [-softcap, softcap] using tanh. 0 = disabled.
+        self.logit_softcap = getattr(config, 'logit_softcap', 0.0)
+        
         # Generation config for PEFT/HuggingFace compatibility
         # This is required when PEFT wraps the model for generation
         self.generation_config = GenerationConfig(
@@ -399,6 +403,11 @@ class PALMModel(nn.Module):
     
             # Compute logits for language modeling
             lm_logits = self.lm_head(hidden_states)
+            
+            # Apply logit softcapping if enabled (Gemma 2 style)
+            # Bounds logits to [-softcap, softcap] to prevent numerical instability
+            if self.logit_softcap > 0:
+                lm_logits = self.logit_softcap * torch.tanh(lm_logits / self.logit_softcap)
 
             # Initialize loss variables
             loss = None
@@ -418,6 +427,11 @@ class PALMModel(nn.Module):
                     max_source_len = int(max_source_len)
                     
                     sae_logits = self.sae_head(hidden_states[:, :max_source_len])
+                    
+                    # Apply softcapping to SAE logits as well
+                    if self.logit_softcap > 0:
+                        sae_logits = self.logit_softcap * torch.tanh(sae_logits / self.logit_softcap)
+                    
                     sae_labels = input_ids[:, :max_source_len].clone()
                     
                     # Mask out positions beyond each sample's actual source_len with -100

@@ -14,6 +14,7 @@ class PALMConfig(PretrainedConfig):
         hidden_size=3072, # Size of hidden layers in the model
         num_hidden_layers=28, # Number of hidden layers in the model
         num_attention_heads=24, # Number of attention heads for multi-head attention mechanism
+        num_kv_heads=None, # Number of key/value heads for GQA (None = same as num_attention_heads)
         intermediate_size=8192, # Size of the intermediate feed-forward layer in transformer blocks
         hidden_act="silu", # Activation function used in hidden layers
         hidden_dropout_prob=0.1, # Dropout probability for hidden layers
@@ -32,6 +33,7 @@ class PALMConfig(PretrainedConfig):
         train_batch_size=64, # Training batch size
         logging_steps=100, # Log metrics every N steps
         sae_weight=0.5, # Weight for SAE loss in combined loss
+        logit_softcap=30.0, # Softcap for logits (0 = disabled). Bounds logits to [-softcap, softcap]
         max_length=512, # Max generation length
         min_length=1, # Min generation length
         gradient_checkpointing=False, # Whether to use gradient checkpointing
@@ -54,10 +56,21 @@ class PALMConfig(PretrainedConfig):
         if eos_token_id is None:
             eos_token_id = getattr(base_config, 'eos_token_id', 2)
         
+        # Handle token IDs that might be lists (e.g., Llama-3.2-Instruct has multiple eos tokens)
+        def _ensure_int(token_id):
+            """Extract first element if token_id is a list."""
+            if isinstance(token_id, list):
+                return token_id[0] if token_id else None
+            return token_id
+        
+        pad_token_id = _ensure_int(pad_token_id)
+        bos_token_id = _ensure_int(bos_token_id)
+        eos_token_id = _ensure_int(eos_token_id)
+        
         # Ensure pad_token_id is within vocab bounds
-        if pad_token_id is not None and pad_token_id >= vocab_size:
-            # Use last valid token as pad_token_id
-            pad_token_id = vocab_size - 1
+        # if pad_token_id is not None and pad_token_id >= vocab_size:
+        #     # Use last valid token as pad_token_id
+        #     pad_token_id = vocab_size - 1
         
         # Call the parent class (PretrainedConfig) constructor with specific token IDs
         super().__init__(
@@ -72,6 +85,7 @@ class PALMConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_attention_heads
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
         self.hidden_dropout_prob = hidden_dropout_prob
@@ -87,6 +101,7 @@ class PALMConfig(PretrainedConfig):
         self.train_batch_size = train_batch_size
         self.logging_steps = logging_steps
         self.sae_weight = sae_weight
+        self.logit_softcap = logit_softcap
         self.max_length = max_length
         self.min_length = min_length
         self.fixed_source_length = fixed_source_length
