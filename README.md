@@ -10,7 +10,7 @@ This creates a stable channel for conditioning on prompt instructions, system co
 
 ## How it works
 
-<img width="2043" height="1006" alt="Image" src="https://github.com/user-attachments/assets/9c288884-cd5e-42e7-8c70-eac32c4a8386" />
+<img width="2036" height="1000" alt="Image" src="https://github.com/user-attachments/assets/f7b03fbd-d1e5-4d53-8da7-c295ccab7396" />
 
 ## Overview
 
