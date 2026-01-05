@@ -5,6 +5,7 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from .attention import PALMAttention, PALMPartialAttention, RMSNorm
 from .embeddings import PALMEmbeddings
+from .kv_cache import PALMCache, CrossLayerKVManager, create_palm_cache, KVCacheConfig
 
 import torch
 import torch.nn as nn
@@ -64,10 +65,15 @@ class PALMLayer(nn.Module):
         x = x + MLP(Norm(x))
     
     This provides better gradient flow and training stability at scale.
+    
+    KV Cache Optimizations:
+    - Cross-layer KV sharing: Partial Attention KV can be shared across layer groups
+    - Hybrid granularity: Older conversation turns can be quantized
     """
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int = 0):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx  # For cross-layer KV sharing
 
         # Pre-normalization layers (RMSNorm for efficiency)
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -91,7 +97,8 @@ class PALMLayer(nn.Module):
         source_len: Optional[int] = None,
         past_key_value: Optional[Tuple] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
+        shared_partial_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             hidden_states: Input tensor
@@ -100,10 +107,14 @@ class PALMLayer(nn.Module):
             source_len: Length of source sequence for extracting source from attention output
             past_key_value: Tuple of ((attn_key, attn_value), (partial_key, partial_value))
             use_cache: Whether to return key/values for caching
+            shared_partial_kv: Optional pre-computed Partial Attention KV from cross-layer sharing.
+                              When provided, skips Fp network computation for Partial Attention.
         
         Returns:
             layer_output: Output tensor
             present_key_value: Tuple of caches if use_cache=True, else None
+            computed_partial_kv: The Partial Attention KV computed by this layer (for cross-layer sharing)
+                                Returns None if using shared_kv or past_key_value
         """
         # Unpack past key values if provided
         past_attn_kv = None
@@ -125,9 +136,12 @@ class PALMLayer(nn.Module):
         hidden_states = residual + attention_output
 
         # Extract source_hidden_states from THIS LAYER's output for partial attention
+        # Only needed if we're computing fresh KV (no shared_kv, no past_partial_kv)
         source_hidden_states = None
         source_position_ids = None
-        if past_partial_kv is None:
+        needs_source = (shared_partial_kv is None and past_partial_kv is None)
+        
+        if needs_source:
             if source_len is None:
                 source_len = self.config.fixed_source_length
             if isinstance(source_len, torch.Tensor):
@@ -152,9 +166,14 @@ class PALMLayer(nn.Module):
             position_ids=position_ids,
             source_position_ids=source_position_ids,
             past_key_value=past_partial_kv,
-            use_cache=use_cache
+            use_cache=use_cache,
+            shared_kv=shared_partial_kv,
         )
         hidden_states = residual + partial_attention_output
+        
+        # Track if this layer computed fresh Partial Attention KV
+        # (for cross-layer sharing - representative layers compute, others reuse)
+        computed_partial_kv = present_partial_kv if needs_source else None
         
         # Pack present key values
         present_key_value = None
@@ -167,7 +186,7 @@ class PALMLayer(nn.Module):
         mlp_output = self.mlp(hidden_states)
         hidden_states = residual + mlp_output
         
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value, computed_partial_kv
     
 
 class PALMModel(nn.Module):
@@ -201,8 +220,19 @@ class PALMModel(nn.Module):
         # Embedding layer (word + language embeddings, NO positional - RoPE handles that)
         self.embeddings = PALMEmbeddings(config)
 
-        # Stack of transformer layers with RoPE
-        self.layers = nn.ModuleList([PALMLayer(config) for _ in range(config.num_hidden_layers)])
+        # Stack of transformer layers with RoPE (each layer knows its index for cross-layer sharing)
+        self.layers = nn.ModuleList([
+            PALMLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
+        ])
+        
+        # Cross-Layer KV Sharing Manager (Strategy #3)
+        # Only enabled when share_partial_kv=True and kv_sharing_groups > 1
+        self.cross_layer_kv_manager: Optional[CrossLayerKVManager] = None
+        if getattr(config, 'share_partial_kv', False) and getattr(config, 'kv_sharing_groups', 1) > 1:
+            self.cross_layer_kv_manager = CrossLayerKVManager(
+                num_layers=config.num_hidden_layers,
+                num_groups=config.kv_sharing_groups,
+            )
         
         # Final RMSNorm before lm_head (required for Pre-Norm architecture)
         self.final_norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -399,14 +429,24 @@ class PALMModel(nn.Module):
     
             # Initialize present key values list
             present_key_values = [] if use_cache else None
+            
+            # Clear cross-layer KV manager for new forward pass (not during incremental decoding)
+            if self.cross_layer_kv_manager is not None and past_key_values is None:
+                self.cross_layer_kv_manager.clear()
     
             # Pass through each layer with RoPE position_ids
             for i, layer in enumerate(self.layers):
                 layer_past_kv = past_key_values[i] if past_key_values is not None else None
                 
+                # Cross-layer KV sharing: get shared KV for this layer's group
+                shared_partial_kv = None
+                if self.cross_layer_kv_manager is not None and past_key_values is None:
+                    # During initial pass (not incremental), check if we should reuse KV
+                    shared_partial_kv = self.cross_layer_kv_manager.get_shared_kv(i)
+                
                 # Use gradient checkpointing if enabled and training
                 if self.gradient_checkpointing and self.training and not use_cache:
-                    def create_custom_forward(module, src_len, pos_ids):
+                    def create_custom_forward(module, src_len, pos_ids, shared_kv):
                         def custom_forward(hidden_states, attention_mask):
                             outputs = module(
                                 hidden_states, 
@@ -414,27 +454,37 @@ class PALMModel(nn.Module):
                                 position_ids=pos_ids,
                                 source_len=src_len,
                                 past_key_value=None, 
-                                use_cache=False
+                                use_cache=False,
+                                shared_partial_kv=shared_kv,
                             )
                             return outputs[0]
                         return custom_forward
                     
                     hidden_states = gradient_checkpoint(
-                        create_custom_forward(layer, max_source_len, position_ids),
+                        create_custom_forward(layer, max_source_len, position_ids, shared_partial_kv),
                         hidden_states,
                         attention_mask,
                         use_reentrant=False
                     )
                     present_kv = None
+                    computed_partial_kv = None
                 else:
-                    hidden_states, present_kv = layer(
+                    hidden_states, present_kv, computed_partial_kv = layer(
                         hidden_states, 
                         attention_mask,
                         position_ids=position_ids,
                         source_len=max_source_len if past_key_values is None else None,
                         past_key_value=layer_past_kv,
-                        use_cache=use_cache
+                        use_cache=use_cache,
+                        shared_partial_kv=shared_partial_kv,
                     )
+                
+                # Cross-layer KV sharing: store computed KV for other layers in the group
+                if (self.cross_layer_kv_manager is not None and 
+                    computed_partial_kv is not None and
+                    past_key_values is None):
+                    # This is a representative layer - store its KV for sharing
+                    self.cross_layer_kv_manager.store_shared_kv(i, *computed_partial_kv)
                 
                 if use_cache:
                     present_key_values.append(present_kv)

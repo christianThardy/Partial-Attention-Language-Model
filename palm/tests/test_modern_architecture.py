@@ -116,8 +116,9 @@ def test_palm_layer_prenorm():
     # Test forward pass
     x = torch.randn(2, 10, 128)
     mask = torch.zeros(2, 1, 10, 10)
-    out, _ = layer(x, attention_mask=mask, source_len=5)
+    out, present_kv, computed_partial_kv = layer(x, attention_mask=mask, source_len=5)
     print(f"   Input: {x.shape}, Output: {out.shape}")
+    print(f"   computed_partial_kv: {computed_partial_kv is not None}")
     assert out.shape == x.shape, "PALMLayer shape mismatch"
     print("   [OK] PALMLayer works")
     return True

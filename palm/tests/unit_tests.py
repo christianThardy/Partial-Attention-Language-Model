@@ -294,7 +294,8 @@ def test_layer_forward():
     hidden_states = torch.randn(2, 10, 128)
     attention_mask = torch.zeros(2, 1, 10, 10)  # All attend
     
-    output, _ = layer(hidden_states, attention_mask)
+    # PALMLayer now returns 3 values: (output, present_key_value, computed_partial_kv)
+    output, _, _ = layer(hidden_states, attention_mask)
     
     assert output.shape == hidden_states.shape, f"Expected {hidden_states.shape}, got {output.shape}"
     assert not torch.isnan(output).any(), "Output should not contain NaN"

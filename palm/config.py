@@ -39,6 +39,15 @@ class PALMConfig(PretrainedConfig):
         sae_weight=0.5,
         logit_softcap=30.0,
         fixed_source_length=100,
+        # KV Cache Optimization - Strategy #3: Cross-Layer KV Sharing
+        # Shares Partial Attention KV across layer groups to reduce memory
+        share_partial_kv=False,  # Enable cross-layer sharing for Partial Attention
+        kv_sharing_groups=4,     # Number of layer groups (4 = ~37% KV reduction)
+        # KV Cache Optimization - Strategy #1: Hybrid Multi-Granularity Cache
+        # Quantizes older conversation turns to reduce memory
+        enable_kv_quantization=False,  # Enable 4-bit quantization for older turns
+        quantize_after_turns=1,        # Keep recent N turns at full precision
+        quantization_bits=4,           # Bits for quantization (4-bit recommended)
         # Training hyperparameters
         learning_rate=5e-5,
         warmup_steps=50,
@@ -114,6 +123,15 @@ class PALMConfig(PretrainedConfig):
         self.sae_weight = sae_weight
         self.logit_softcap = logit_softcap
         self.fixed_source_length = fixed_source_length
+        
+        # KV Cache Optimization - Strategy #3: Cross-Layer KV Sharing
+        self.share_partial_kv = share_partial_kv
+        self.kv_sharing_groups = kv_sharing_groups
+        
+        # KV Cache Optimization - Strategy #1: Hybrid Multi-Granularity Cache
+        self.enable_kv_quantization = enable_kv_quantization
+        self.quantize_after_turns = quantize_after_turns
+        self.quantization_bits = quantization_bits
         
         # Training hyperparameters
         self.learning_rate = learning_rate

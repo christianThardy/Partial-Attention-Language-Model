@@ -468,6 +468,7 @@ class PALMPartialAttention(nn.Module):
         source_position_ids: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        shared_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
@@ -478,6 +479,9 @@ class PALMPartialAttention(nn.Module):
             source_position_ids: Position indices for source RoPE [batch_size, source_len]
             past_key_value: Tuple of (past_key, past_value) from source - can be reused
             use_cache: Whether to return key/value for caching
+            shared_kv: Optional pre-computed (key, value) from cross-layer sharing.
+                       When provided, skips Fp network computation and uses these KVs directly.
+                       Used for cross-layer KV sharing optimization (Strategy #3).
         
         Returns:
             attention_output: Output tensor (WITHOUT residual connection - caller adds it)
@@ -490,13 +494,23 @@ class PALMPartialAttention(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         
-        # For partial attention, source K/V can be cached and reused since source doesn't change
-        if past_key_value is not None:
+        # Determine source of K/V: shared_kv > past_key_value > compute from source_states
+        # Priority order for cross-layer sharing optimization:
+        # 1. shared_kv: Pre-computed from representative layer (cross-layer sharing)
+        # 2. past_key_value: Cached from previous forward pass (standard caching)
+        # 3. Compute: Run Fp network on source_states (first pass, no sharing)
+        
+        computed_kv = False  # Track if we computed KV (for sharing with other layers)
+        
+        if shared_kv is not None:
+            # Cross-layer sharing: use KV from representative layer
+            key_layer, value_layer = shared_kv
+        elif past_key_value is not None:
             # Reuse cached source K/V (already in num_kv_heads format)
             key_layer, value_layer = past_key_value
         else:
             if source_states is None:
-                raise ValueError("source_states required when past_key_value is None")
+                raise ValueError("source_states required when past_key_value is None and shared_kv is None")
             
             source_len = source_states.shape[1]
             
@@ -521,9 +535,14 @@ class PALMPartialAttention(nn.Module):
             cos_k, sin_k = self.rotary_emb(key_layer, source_position_ids)
             # Only rotate keys, we'll rotate queries separately with their positions
             key_layer = (key_layer * cos_k.unsqueeze(1)) + (rotate_half(key_layer) * sin_k.unsqueeze(1))
+            
+            computed_kv = True  # Mark that we computed fresh KV
         
         # Store for caching if requested (cache the smaller KV)
-        present_key_value = (key_layer, value_layer) if use_cache else None
+        # Only cache if we computed it ourselves (not from shared_kv)
+        # Note: We return KV even when use_cache=False if we computed fresh KV,
+        # because the caller may need it for cross-layer sharing
+        present_key_value = (key_layer, value_layer) if (use_cache or computed_kv) and not shared_kv else None
     
         # Compute query matrix from full hidden states (always recomputed, full heads)
         query_layer = self.transpose_for_scores(self.query(hidden_states), self.num_attention_heads)
