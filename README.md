@@ -14,7 +14,7 @@ This creates a stable channel for conditioning on prompt instructions, system co
 
 ## Overview
 
-This PALM implementation operationalizes and modernizes research that re-interprets decoder-only architectures as regularized encoder-decoders (Fu et al.), but for autoregressive chat models. By treating the model as an architectural wrapper, PALM integrates partial attention mechanisms into existing open-weights (Llama, Mistral, Qwen, etc.) while preserving their fundamental learned representations.
+This PALM implementation operationalizes and modernizes research that re-interprets decoder-only architectures as regularized encoder-decoders (Fu et al.), but for autoregressive chat models. By treating the model as an architectural wrapper, PALM integrates partial attention mechanisms into existing dense, open-weights (Llama, Mistral, Qwen, etc.) while preserving their fundamental learned representations.
 
 PALM enhances standard decoder-only models by introducing:
 
