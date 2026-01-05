@@ -158,9 +158,7 @@ def run_context_rot_probes(
         probe_iter = tqdm(probe_iter, desc="Context Rot Probes", leave=False)
     probe_idx = iter(probe_iter)
     
-    # =========================================================================
     # Probe 1: Focused vs Full Context (2 samples)
-    # =========================================================================
     focused_correct = 0
     full_correct = 0
     
@@ -192,9 +190,7 @@ Answer:"""
     
     focused_full_delta = (focused_correct - full_correct) / len(QUICK_NEEDLE_TESTS)
     
-    # =========================================================================
     # Probe 2: Distractor Confusion (2 samples with 1 distractor each)
-    # =========================================================================
     distractor_correct = 0
     
     for i, test in enumerate(QUICK_NEEDLE_TESTS):
@@ -216,9 +212,7 @@ Answer with only the specific information asked:"""
     
     distractor_accuracy = distractor_correct / len(QUICK_NEEDLE_TESTS)
     
-    # =========================================================================
     # Probe 3: Repeated Words (quick 2-length test)
-    # =========================================================================
     def test_repeated_words(num_words: int, probe_name: str) -> float:
         """Test at a specific word count."""
         common = "apple"
@@ -274,4 +268,3 @@ def format_probe_results(result: ContextRotProbeResult) -> str:
         f"distractor_acc={result.distractor_accuracy:.1%}, "
         f"repeat_lev={result.repeated_words_short_score:.2f}->{result.repeated_words_long_score:.2f}"
     )
-

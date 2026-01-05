@@ -21,9 +21,7 @@ import json
 import os
 
 
-# =============================================================================
 # STEPWISE HALLUCINATION ANALYSIS
-# =============================================================================
 # From Section 4.2 of the paper: "Hallucination Ratio (HR) Analysis"
 #
 # The hallucination ratio at step i is defined as:
@@ -231,9 +229,7 @@ def compute_stepwise_hallucination_ratio(
     )
 
 
-# =============================================================================
 # NUMERICAL SENSITIVITY ANALYSIS
-# =============================================================================
 # From Section 4.3 of the paper: "Sensitivity Analysis"
 #
 # Measures how sensitive the output distribution at step i is to small
@@ -440,10 +436,7 @@ def numerical_sensitivity_analysis(
     )
 
 
-# =============================================================================
 # COMBINED PAPER METRICS EVALUATOR
-# =============================================================================
-
 @dataclass
 class PaperMetricsResult:
     """Combined results from all paper-based metrics."""
@@ -646,10 +639,7 @@ class PaperMetricsEvaluator:
         return "\n".join(lines)
 
 
-# =============================================================================
 # PLOTTING FUNCTIONS
-# =============================================================================
-
 def plot_stepwise_hallucination(
     result: StepwiseHallucinationResult,
     output_path: str = "stepwise_hallucination.png",
@@ -836,10 +826,7 @@ def plot_combined_paper_metrics(
     print(f"Saved combined paper metrics plot to {output_path}")
 
 
-# =============================================================================
 # SAVE/LOAD FUNCTIONS
-# =============================================================================
-
 def save_paper_metrics(
     result: PaperMetricsResult,
     output_file: str = "paper_metrics.json",
@@ -871,4 +858,3 @@ def load_paper_metrics(input_file: str) -> Optional[PaperMetricsResult]:
     except Exception as e:
         print(f"Failed to load paper metrics: {e}")
         return None
-

@@ -15,10 +15,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
 # ARCHITECTURE DETECTION
-# =============================================================================
-
 def detect_model_architecture(model_name_or_config: Union[str, "PretrainedConfig"]) -> str:
     """
     Detect the architecture type from a model name or config.
@@ -55,10 +52,7 @@ def detect_model_architecture(model_name_or_config: Union[str, "PretrainedConfig
         return 'llama'
 
 
-# =============================================================================
 # WEIGHT KEY MAPPINGS
-# =============================================================================
-
 def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[str]]:
     """
     Get weight key mappings from source model to PALM model.
@@ -157,10 +151,7 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
     return mapping
 
 
-# =============================================================================
 # WEIGHT TRANSFER
-# =============================================================================
-
 def transfer_weights_to_palm(
     palm_model: torch.nn.Module,
     source_model_name: str,
@@ -291,10 +282,7 @@ def transfer_weights_to_palm(
     return palm_model
 
 
-# =============================================================================
 # PALM COMPONENT BOOTSTRAPPING
-# =============================================================================
-
 def _get_attention_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str]:
     """
     Get source attention key patterns for a given architecture.
@@ -564,4 +552,3 @@ def bootstrap_palm_components(
         logger.info(f"PALM component bootstrapping complete: {bootstrapped_components}")
     
     return palm_state
-

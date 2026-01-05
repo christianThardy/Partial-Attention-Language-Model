@@ -25,12 +25,8 @@ import torch.nn as nn
 import pytest
 from typing import List, Tuple
 
-
-# =============================================================================
 # Copy of training utilities from notebook for testing
 # (In production, these would be moved to palm/training/ module)
-# =============================================================================
-
 class SAEWeightScheduler:
     """
     Scheduler for SAE loss weight that implements the PALM training recipe:
@@ -181,10 +177,7 @@ class DynamicSAEWeight:
         return new_weight, ""
 
 
-# =============================================================================
 # Helper: Create simple test model
-# =============================================================================
-
 class SimpleTestModel(nn.Module):
     """Simple model for testing training utilities."""
     def __init__(self):
@@ -236,10 +229,7 @@ def freeze_backbone(model, freeze: bool = True):
     return frozen_count, unfrozen_count
 
 
-# =============================================================================
 # Tests: SAEWeightScheduler
-# =============================================================================
-
 class TestSAEWeightScheduler:
     """Tests for SAE weight scheduling."""
     
@@ -330,10 +320,7 @@ class TestSAEWeightScheduler:
         assert scheduler.get_weight(2) == pytest.approx(0.35, abs=0.01)
 
 
-# =============================================================================
 # Tests: EMAModel
-# =============================================================================
-
 class TestEMAModel:
     """Tests for Exponential Moving Average."""
     
@@ -455,10 +442,7 @@ class TestEMAModel:
                 assert fast_diff > 0
 
 
-# =============================================================================
 # Tests: LossSpikeDetector
-# =============================================================================
-
 class TestLossSpikeDetector:
     """Tests for loss spike detection."""
     
@@ -546,10 +530,7 @@ class TestLossSpikeDetector:
         assert not detector.should_reduce_lr()
 
 
-# =============================================================================
 # Tests: DynamicSAEWeight
-# =============================================================================
-
 class TestDynamicSAEWeight:
     """Tests for dynamic SAE weight adjustment."""
     
@@ -627,10 +608,7 @@ class TestDynamicSAEWeight:
         assert msg == ""
 
 
-# =============================================================================
 # Tests: freeze_backbone
-# =============================================================================
-
 class TestFreezeBackbone:
     """Tests for backbone freezing functionality."""
     
@@ -693,10 +671,7 @@ class TestFreezeBackbone:
         assert unfrozen_count == actual_unfrozen
 
 
-# =============================================================================
 # Integration Tests
-# =============================================================================
-
 class TestTrainingIntegration:
     """Integration tests for training utilities working together."""
     
@@ -756,10 +731,7 @@ class TestTrainingIntegration:
         assert sae_scheduler.get_weight(3) == pytest.approx(0.3, abs=0.01)
 
 
-# =============================================================================
 # Main
-# =============================================================================
-
 def run_all_tests():
     """Run all tests without pytest."""
     import traceback
@@ -814,4 +786,3 @@ def run_all_tests():
 if __name__ == "__main__":
     success = run_all_tests()
     sys.exit(0 if success else 1)
-

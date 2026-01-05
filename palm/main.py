@@ -77,9 +77,7 @@ def maybe_apply_lora(model, use_lora=False, use_qlora=False):
     return model
 
 def main():
-    ###########################################
-    # 0. ENVIRONMENT SETUP + CONFIG
-    ###########################################
+    # ENVIRONMENT SETUP + CONFIG
     login(token=HF_TOKEN)
 
     # Enable TF32 for faster matrix multiplies
@@ -95,17 +93,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ###########################################
-    # 1. LOAD TOKENIZER
-    ###########################################
+    # LOAD TOKENIZER
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, device_map='auto')
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     logger.info(f"Tokenizer pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
 
-    ###########################################
-    # 2. LOAD AND COMBINE DATASETS
-    ###########################################
+    # LOAD AND COMBINE DATASETS
     dataset_1 = load_dataset(DATASET_1_NAME, split="all").remove_columns(["meta"])
     dataset_1 = dataset_1.shuffle(seed=42).select(range(DS1_MAX_SAMPLES))
 
@@ -124,9 +118,7 @@ def main():
     # For random splitting
     train_dataset, eval_dataset = random_split(shuffled_dataset, [train_size, eval_size])
 
-    ###########################################
-    # 3. PREPROCESS
-    ###########################################
+    # PREPROCESS
     def _preproc_fn(examples):
         return preprocess_function(examples, tokenizer, MAX_SEQ_LENGTH)
 
@@ -156,9 +148,7 @@ def main():
     )
     print("Train-eval data loading complete")
 
-    ###########################################
-    # 4. CREATE MODEL + CONFIG
-    ###########################################
+    # CREATE MODEL + CONFIG
     config = PALMConfig(
         base_model_name=MODEL_NAME,
         hidden_dropout_prob=HIDDEN_DROPOUT_PROB,
@@ -196,9 +186,7 @@ def main():
         model = torch.compile(model)
         logger.info("Compiled model with torch.compile for speed.")
 
-    ###########################################
-    # 5. TRAINER
-    ###########################################
+    # TRAINER
     trainer = PALMTrainer(
         model=model,
         train_dataloader=train_dataloader,
@@ -210,9 +198,7 @@ def main():
     # Train the model
     trainer.train()
 
-    ###########################################
-    # 6. SAVE MODEL + TOKENIZER
-    ###########################################
+    # SAVE MODEL + TOKENIZER
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     model.save_pretrained(
         OUTPUT_DIR,

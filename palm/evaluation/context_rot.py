@@ -60,10 +60,7 @@ def normalized_levenshtein_score(gold: str, pred: str) -> float:
     return 1.0 - (distance / max_len)
 
 
-# =============================================================================
 # TEST DATA: Needles, Questions, and Distractors
-# =============================================================================
-
 # Lexical needle-question pairs (direct word overlap)
 LEXICAL_NEEDLES = [
     {
@@ -190,10 +187,7 @@ HAYSTACK_PARAGRAPHS = [
 ]
 
 
-# =============================================================================
 # RESULT DATACLASSES
-# =============================================================================
-
 @dataclass
 class RepeatedWordsResult:
     """Result of a single repeated words test."""
@@ -325,10 +319,7 @@ class ContextRotSuiteResult:
         return d
 
 
-# =============================================================================
 # CONTEXT ROT EVALUATOR
-# =============================================================================
-
 class ContextRotEvaluator:
     """
     Evaluates model resistance to context rot using tests from Chroma research.
@@ -455,10 +446,7 @@ class ContextRotEvaluator:
         answer_lower = answer.lower()
         return any(phrase in answer_lower for phrase in abstention_phrases)
     
-    # =========================================================================
     # TEST 1: Needle-in-Haystack (Lexical vs Semantic)
-    # =========================================================================
-    
     def test_needle_in_haystack(
         self,
         needle_type: str = "both",  # "lexical", "semantic", or "both"
@@ -517,10 +505,7 @@ Answer:"""
         
         return results
     
-    # =========================================================================
     # TEST 2: Distractor Confusion
-    # =========================================================================
-    
     def test_distractor_confusion(
         self,
         distractor_counts: List[int] = [0, 1, 4],
@@ -589,10 +574,7 @@ Answer:"""
         
         return results
     
-    # =========================================================================
     # TEST 3: Focused vs Full Context
-    # =========================================================================
-    
     def test_focused_vs_full(
         self,
         num_samples: int = 6,
@@ -651,10 +633,7 @@ Answer:"""
         
         return results
     
-    # =========================================================================
     # TEST 4: Repeated Words (Chroma context-rot benchmark)
-    # =========================================================================
-    
     def test_repeated_words(
         self,
         common_word: str = "apple",
@@ -801,10 +780,7 @@ Reproduced text:"""
             avg_scores=avg_scores,
         )
     
-    # =========================================================================
     # FULL SUITE
-    # =========================================================================
-    
     def run_full_suite(
         self,
         needle_samples: int = 6,
@@ -958,11 +934,7 @@ Reproduced text:"""
         
         return "\n".join(lines)
 
-
-# =============================================================================
 # PLOTTING
-# =============================================================================
-
 def plot_context_rot_results(result: ContextRotSuiteResult, output_path: str):
     """Create visualization of context rot results."""
     try:
@@ -1142,4 +1114,3 @@ def load_context_rot_results(input_path: str) -> Dict:
     """Load results from JSON."""
     with open(input_path, "r") as f:
         return json.load(f)
-

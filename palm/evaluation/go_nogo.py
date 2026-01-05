@@ -147,9 +147,7 @@ def assess_go_nogo(
     criteria = criteria or GoNoGoCriteria()
     results = []
     
-    # =========================================================================
     # CRITICAL: Source Ablation Drop
-    # =========================================================================
     if ablation_result is not None:
         # Calculate faithfulness drop when source is corrupted
         normal_faith = ablation_result.normal.entity_precision
@@ -165,9 +163,7 @@ def assess_go_nogo(
             importance="critical",
         ))
     
-    # =========================================================================
     # CRITICAL: Distractor Resistance
-    # =========================================================================
     if context_rot_result is not None:
         distractor_acc_4 = context_rot_result.distractor_accuracy_by_count.get(4, 0)
         
@@ -180,9 +176,7 @@ def assess_go_nogo(
             importance="critical",
         ))
     
-    # =========================================================================
     # IMPORTANT: Length Degradation
-    # =========================================================================
     if context_rot_result is not None:
         length_deg = context_rot_result.length_degradation
         
@@ -195,9 +189,7 @@ def assess_go_nogo(
             importance="important",
         ))
     
-    # =========================================================================
     # IMPORTANT: Semantic Needle Accuracy
-    # =========================================================================
     if context_rot_result is not None:
         semantic_acc = context_rot_result.semantic_needle_accuracy
         
@@ -210,9 +202,7 @@ def assess_go_nogo(
             importance="important",
         ))
     
-    # =========================================================================
     # NICE TO HAVE: Repetition Rate
-    # =========================================================================
     if staggered_result is not None and staggered_result.degeneration is not None:
         rep_rate = staggered_result.degeneration.repetition_rate
         
@@ -225,9 +215,7 @@ def assess_go_nogo(
             importance="nice_to_have",
         ))
     
-    # =========================================================================
     # NICE TO HAVE: Distinct-2
-    # =========================================================================
     if staggered_result is not None and staggered_result.degeneration is not None:
         distinct_2 = staggered_result.degeneration.distinct_2gram
         
@@ -240,9 +228,7 @@ def assess_go_nogo(
             importance="nice_to_have",
         ))
     
-    # =========================================================================
     # Compute Summary
-    # =========================================================================
     critical = [r for r in results if r.importance == "critical"]
     important = [r for r in results if r.importance == "important"]
     
@@ -283,4 +269,3 @@ def save_go_nogo_assessment(assessment: GoNoGoAssessment, output_path: str):
     with open(output_path, "w") as f:
         json.dump(assessment.to_dict(), f, indent=2)
     print(f"Saved go/no-go assessment to {output_path}")
-

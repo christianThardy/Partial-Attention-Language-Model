@@ -596,9 +596,7 @@ def save_ablation_results(
     print(f"Saved ablation results to {output_file}")
 
 
-# =============================================================================
 # GRADUAL ABLATION SENSITIVITY CURVE
-# =============================================================================
 # Good visualization: X = % corrupted, Y = quality metric
 # Compare baseline vs PALM to show PALM degrades more sharply (uses source more)
 

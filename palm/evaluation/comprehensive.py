@@ -115,10 +115,7 @@ class PALMScore:
         }
 
 
-# =============================================================================
 # Loss Decomposition
-# =============================================================================
-
 def compute_loss_decomposition(
     lm_loss: torch.Tensor,
     sae_loss: torch.Tensor,
@@ -215,10 +212,7 @@ def compute_degeneration_metrics(
     )
 
 
-# =============================================================================
 # Faithfulness & Hallucination Detection
-# =============================================================================
-
 def extract_entities_simple(text: str) -> set:
     """
     Simple entity extraction: capitalized words, numbers, quoted phrases.
@@ -295,10 +289,7 @@ def compute_faithfulness_metrics(
     )
 
 
-# =============================================================================
 # Mask Compliance
-# =============================================================================
-
 def compute_mask_compliance(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -375,10 +366,7 @@ def compute_mask_compliance(
     )
 
 
-# =============================================================================
 # PALLM Composite Score
-# =============================================================================
-
 def compute_palm_score(
     faithfulness: float,
     hallucination: float,
@@ -404,10 +392,7 @@ def compute_palm_score(
     )
 
 
-# =============================================================================
 # Ablation Evaluation Runner
-# =============================================================================
-
 @dataclass
 class AblationResult:
     """Results for a single ablation configuration."""
@@ -627,10 +612,7 @@ class AblationEvaluator:
         return "\n".join(lines)
 
 
-# =============================================================================
 # Smoke Test Generation Comparison
-# =============================================================================
-
 def compare_generations_cached_vs_uncached(
     model: torch.nn.Module,
     tokenizer,
@@ -686,10 +668,7 @@ def compare_generations_cached_vs_uncached(
     }
 
 
-# =============================================================================
 # QA-based Faithfulness Evaluation
-# =============================================================================
-
 def evaluate_answerable_from_source(
     model: torch.nn.Module,
     tokenizer,
@@ -804,4 +783,3 @@ def evaluate_distractor_swap(
         "consistency": (correct_first == correct_second) / total if total > 0 else 0.0,
         "total": total,
     }
-
