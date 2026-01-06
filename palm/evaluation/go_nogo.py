@@ -151,7 +151,7 @@ def assess_go_nogo(
     if ablation_result is not None:
         # Calculate faithfulness drop when source is corrupted
         normal_faith = ablation_result.normal.entity_precision
-        random_faith = ablation_result.random_source.entity_precision
+        random_faith = ablation_result.random.entity_precision
         ablation_drop = normal_faith - random_faith
         
         results.append(CriterionResult(
