@@ -277,6 +277,31 @@ class PALMModel(nn.Module):
         if self._tie_sae_head:
             return self.lm_head  # Use lm_head for SAE (tied weights)
         return self.sae_head
+    
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Enable gradient checkpointing for memory-efficient training.
+        
+        Gradient checkpointing trades compute for memory by not storing intermediate
+        activations during forward pass, recomputing them during backward.
+        
+        Args:
+            gradient_checkpointing_kwargs: Optional dict of kwargs (for HF compatibility)
+        """
+        self.gradient_checkpointing = True
+        # Also update config for consistency
+        if hasattr(self, 'config'):
+            self.config.gradient_checkpointing = True
+    
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing = False
+        if hasattr(self, 'config'):
+            self.config.gradient_checkpointing = False
+    
+    def is_gradient_checkpointing(self) -> bool:
+        """Check if gradient checkpointing is enabled."""
+        return getattr(self, 'gradient_checkpointing', False)
 
     def create_bidirectional_attention_mask(self, input_ids, source_len=None):
         """
