@@ -2,7 +2,7 @@
 
 As generations grow longer, LLMs often exhibit **context rot**. This **attention degradation** causes a loss of grounding in earlier context, which in turn reduces adherence to retrieved evidence, constraints and ultimately results in instruction drift, hallucination, and forgetting.
 
-In standard decoder-only transformers, this degradation is driven by how attention and the residual stream become increasingly dominated by the model's own continuation, weakening effective access to the original source tokens as generation continues.
+In standard decoder-only transformers, this degradation is driven by how the attention and residual stream become increasingly dominated by the model's own continuation, weakening effective access to the original source tokens as generation continues.
 
 **PALM** (≠ [PaLM](https://en.wikipedia.org/wiki/PaLM)) is a decoder-only architecture that preserves source connectivity throughout decoding by introducing a partial attention pathway: generated tokens can attend directly to the full source prefix at every step, while maintaining causal structure over the generated continuation. 
 
