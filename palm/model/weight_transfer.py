@@ -556,7 +556,10 @@ def bootstrap_palm_components(
         bootstrapped_components.append('partial_attn_norm')
         logger.info(f"✓ Cloned attn_norm to partial_attn_norm for {norm_bootstrapped} layers")
     
-    # 3. Fp NETWORK ← IDENTITY-LIKE INITIALIZATION
+    # 3. Fp NETWORK ← NEAR-IDENTITY INITIALIZATION
+    # IMPORTANT: Previous init (0.1 * I) was too weak - only ~5% of source passed through!
+    # New init: 0.9 * I + small noise, so Fp(x) ≈ 0.9*x initially (strong source signal)
+    # The network learns to refine this, not rebuild from near-zero.
     fp_initialized = 0
     for i in range(num_layers):
         fp_prefix = f'layers.{i}.partial_attention'
@@ -568,13 +571,17 @@ def bootstrap_palm_components(
             device = weight.device
             dtype = weight.dtype
             
+            # Initialize as strong identity with small noise
+            # SiLU(0.9*x) ≈ 0.9*x * sigmoid(0.9*x) ≈ 0.9*x * 0.71 ≈ 0.64*x
+            # Much stronger than previous 0.05*x!
             identity_like = torch.eye(hidden_size, device=device, dtype=dtype)
-            palm_state[fp1_key] = 0.01 * torch.randn_like(weight) + 0.1 * identity_like
+            palm_state[fp1_key] = 0.02 * torch.randn_like(weight) + 0.9 * identity_like
             fp_initialized += 1
         
         fp2_key = f'{fp_prefix}.Fp_linear2.weight'
         if fp2_key in palm_state:
-            palm_state[fp2_key] = torch.zeros_like(palm_state[fp2_key])
+            # Small values (not zero) to allow gradients to flow
+            palm_state[fp2_key] = 0.01 * torch.randn_like(palm_state[fp2_key])
             fp_initialized += 1
         
         for bias_key in [f'{fp_prefix}.Fp_linear1.bias', f'{fp_prefix}.Fp_linear2.bias']:

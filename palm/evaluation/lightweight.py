@@ -533,10 +533,15 @@ class StaggeredEvaluator:
                 # Get the underlying model for generation if wrapped by PEFT
                 gen_model = self._get_generation_model()
                 
+                # Use nucleus sampling with repetition penalty for more realistic evaluation
+                # Greedy decoding amplifies repetition issues; sampling shows true diversity
                 generated = gen_model.generate(
                     source_ids,
                     max_length=source_len + self.max_gen_tokens,
-                    do_sample=False,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.15,
                     use_cache=True,
                 )
                 gen_tokens = generated[0, source_len:].tolist()
@@ -574,10 +579,14 @@ class StaggeredEvaluator:
                 # Get the underlying model for generation if wrapped by PEFT
                 gen_model = self._get_generation_model()
                 
+                # Use nucleus sampling with repetition penalty for more realistic evaluation
                 generated = gen_model.generate(
                     source_ids,
                     max_length=source_len + self.max_gen_tokens,
-                    do_sample=False,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.15,
                     use_cache=True,
                 )
                 gen_tokens = generated[0, source_len:].tolist()

@@ -257,6 +257,10 @@ class PALMModel(nn.Module):
         # Logit softcapping to prevent numerical instability (Gemma 2 style)
         self.logit_softcap = getattr(config, 'logit_softcap', 0.0)
         
+        # Label smoothing for regularization (helps prevent repetition/mode collapse)
+        # Default 0.0 = no smoothing. Recommended: 0.05-0.1 to prevent overconfidence
+        self.label_smoothing = getattr(config, 'label_smoothing', 0.0)
+        
         # Generation config for PEFT/HuggingFace compatibility
         self.generation_config = GenerationConfig(
             max_length=getattr(config, 'max_length', 512),
@@ -531,7 +535,9 @@ class PALMModel(nn.Module):
             
             # Compute loss if labels are provided
             if labels is not None:
-                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                # Use label smoothing to prevent mode collapse / repetition
+                # Label smoothing regularizes by softening targets: p_target = (1-ε)*one_hot + ε/V
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=self.label_smoothing)
                 loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
 
                 # Calculate SAE loss only if source_len was explicitly provided
@@ -554,6 +560,7 @@ class PALMModel(nn.Module):
                     source_mask = range_tensor >= source_len.unsqueeze(1)
                     sae_labels[source_mask] = -100
                     
+                    # SAE loss also uses label smoothing
                     sae_loss = loss_fct(sae_logits.view(-1, self.config.vocab_size), sae_labels.view(-1))
                     
                     # Combine losses

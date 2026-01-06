@@ -39,6 +39,7 @@ class PALMConfig(PretrainedConfig):
         sae_weight=0.5,
         logit_softcap=30.0,
         fixed_source_length=100,
+        label_smoothing=0.0,  # Label smoothing for regularization (0.05-0.1 helps prevent repetition)
         # KV Cache Optimization - Strategy #3: Cross-Layer KV Sharing
         # Shares Partial Attention KV across layer groups to reduce memory
         share_partial_kv=False,  # Enable cross-layer sharing for Partial Attention
@@ -123,6 +124,7 @@ class PALMConfig(PretrainedConfig):
         self.sae_weight = sae_weight
         self.logit_softcap = logit_softcap
         self.fixed_source_length = fixed_source_length
+        self.label_smoothing = label_smoothing
         
         # KV Cache Optimization - Strategy #3: Cross-Layer KV Sharing
         self.share_partial_kv = share_partial_kv

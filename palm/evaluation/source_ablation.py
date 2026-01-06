@@ -242,11 +242,15 @@ class SourceAblationEvaluator:
         self.model.eval()
         source_len = source_ids.size(1)
         
-        # Generate
+        # Generate with sampling and repetition penalty for realistic evaluation
+        # Greedy decoding amplifies repetition; sampling shows true model behavior
         generated = self.model.generate(
             source_ids,
             max_length=source_len + self.max_gen_tokens,
-            do_sample=False,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.15,
             use_cache=True,
         )
         
