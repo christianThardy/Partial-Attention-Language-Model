@@ -68,7 +68,7 @@ from palm import PALMConfig, PALMModel, transfer_weights_to_palm
 
 # Initialize configuration (inherits from any HuggingFace model)
 config = PALMConfig(
-    base_model_name="meta-llama/Llama-3.2-3B",
+    base_model_name="meta-llama/Llama-3.3-70B-Instruct",
     fixed_source_length=128,
     sae_weight=0.5,
 )
@@ -96,9 +96,9 @@ PALM doesn't train from scratch, it bootstraps from any compatible open-weight m
 ```python
 from palm import PALMModel, PALMConfig, transfer_weights_to_palm
 
-# Supports: Llama, Qwen, Mistral, Phi, Gemma, Falcon
+# Supports: Llama, Qwen, Mistral, Phi, Gemma, Falcon, etc
 model = PALMModel(PALMConfig(base_model_name="Qwen/Qwen2.5-3B"))
-model = transfer_weights_to_palm(model, "Qwen/Qwen2.5-3B")
+model = transfer_weights_to_palm(model, "NousResearch/Hermes-4.3-36B")
 ```
 
 **What transfers:** Self-attention projections (Q, K, V, O), MLP weights, embeddings, LM head; the bulk of the model.
