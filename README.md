@@ -69,7 +69,7 @@ from palm import PALMConfig, PALMModel, transfer_weights_to_palm
 # Initialize configuration (inherits from any HuggingFace model)
 config = PALMConfig(
     base_model_name="meta-llama/Llama-3.3-70B-Instruct",
-    fixed_source_length=128,
+    fixed_source_length=1024,
     sae_weight=0.5,
 )
 
