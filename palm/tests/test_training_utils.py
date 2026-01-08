@@ -671,6 +671,345 @@ class TestFreezeBackbone:
         assert unfrozen_count == actual_unfrozen
 
 
+# Import PartialAttentionWarmup and get_partial_attention_param_count from utils
+from palm.training.utils import PartialAttentionWarmup, get_partial_attention_param_count
+
+
+# Helper: Create PALM-style test model for warmup testing
+class PALMStyleTestModel(nn.Module):
+    """
+    Test model with PALM-like structure for testing PartialAttentionWarmup.
+    Has proper partial_attention submodules (query, key, value, dense, Fp_*)
+    and partial_attn_norm layers.
+    """
+    def __init__(self, hidden_size=32, num_layers=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        
+        # Backbone layers
+        self.embeddings = nn.Embedding(100, hidden_size)
+        self.layers = nn.ModuleList([
+            self._make_layer(hidden_size) for _ in range(num_layers)
+        ])
+        
+        # Output heads
+        self.lm_head = nn.Linear(hidden_size, 100)
+        self.sae_head = nn.Linear(hidden_size, 100)
+    
+    def _make_layer(self, hidden_size):
+        """Create a layer with PALM-style partial attention."""
+        layer = nn.Module()
+        
+        # Regular attention (backbone)
+        layer.attention = nn.Linear(hidden_size, hidden_size)
+        layer.attn_norm = nn.LayerNorm(hidden_size)
+        
+        # Partial attention (PALM-specific)
+        layer.partial_attention = nn.Module()
+        layer.partial_attention.query = nn.Linear(hidden_size, hidden_size)
+        layer.partial_attention.key = nn.Linear(hidden_size, hidden_size)
+        layer.partial_attention.value = nn.Linear(hidden_size, hidden_size)
+        layer.partial_attention.dense = nn.Linear(hidden_size, hidden_size)
+        layer.partial_attention.Fp_linear1 = nn.Linear(hidden_size, hidden_size)
+        layer.partial_attention.Fp_linear2 = nn.Linear(hidden_size, hidden_size)
+        
+        # Partial attention norm (PALM-specific)
+        layer.partial_attn_norm = nn.LayerNorm(hidden_size)
+        
+        # MLP (backbone)
+        layer.mlp = nn.Linear(hidden_size, hidden_size)
+        layer.mlp_norm = nn.LayerNorm(hidden_size)
+        
+        return layer
+    
+    def forward(self, x):
+        x = self.embeddings(x)
+        for layer in self.layers:
+            x = layer.attention(x) + x
+        return self.lm_head(x), self.sae_head(x)
+
+
+# Tests: PartialAttentionWarmup
+class TestPartialAttentionWarmup:
+    """Tests for PartialAttentionWarmup class."""
+    
+    def test_initialization_defaults(self):
+        """Test default initialization values."""
+        warmup = PartialAttentionWarmup()
+        
+        assert warmup.warmup_steps == 500
+        assert warmup.warmup_lr == 5e-4
+        assert warmup.enabled == True
+        assert warmup._warmup_applied == False
+        assert warmup._warmup_completed == False
+    
+    def test_initialization_custom(self):
+        """Test custom initialization values."""
+        warmup = PartialAttentionWarmup(
+            warmup_steps=1000,
+            warmup_lr=1e-3,
+            enabled=False
+        )
+        
+        assert warmup.warmup_steps == 1000
+        assert warmup.warmup_lr == 1e-3
+        assert warmup.enabled == False
+    
+    def test_is_active_during_warmup(self):
+        """is_active should return True during warmup phase."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=True)
+        
+        assert warmup.is_active(0) == True
+        assert warmup.is_active(50) == True
+        assert warmup.is_active(99) == True
+    
+    def test_is_active_after_warmup(self):
+        """is_active should return False after warmup phase."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=True)
+        
+        assert warmup.is_active(100) == False
+        assert warmup.is_active(200) == False
+    
+    def test_is_active_when_disabled(self):
+        """is_active should return False when disabled."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=False)
+        
+        assert warmup.is_active(0) == False
+        assert warmup.is_active(50) == False
+    
+    def test_just_completed_at_transition(self):
+        """just_completed should return True exactly at warmup_steps."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=True)
+        
+        # Before transition
+        assert warmup.just_completed(99) == False
+        
+        # At transition
+        assert warmup.just_completed(100) == True
+        
+        # After (already marked as completed)
+        assert warmup.just_completed(100) == False
+        assert warmup.just_completed(101) == False
+    
+    def test_just_completed_when_disabled(self):
+        """just_completed should return False when disabled."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=False)
+        
+        assert warmup.just_completed(100) == False
+    
+    def test_get_phase_name(self):
+        """get_phase_name should return correct phase."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=True)
+        
+        assert warmup.get_phase_name(50) == "PARTIAL_ATTN_WARMUP"
+        assert warmup.get_phase_name(100) == "NORMAL"
+    
+    def test_is_warmup_trainable_patterns(self):
+        """_is_warmup_trainable should match correct parameter patterns."""
+        warmup = PartialAttentionWarmup()
+        
+        # Should match
+        assert warmup._is_warmup_trainable('layers.0.partial_attention.query.weight') == True
+        assert warmup._is_warmup_trainable('layers.0.partial_attention.key.weight') == True
+        assert warmup._is_warmup_trainable('layers.0.partial_attention.value.weight') == True
+        assert warmup._is_warmup_trainable('layers.0.partial_attention.dense.weight') == True
+        assert warmup._is_warmup_trainable('layers.0.partial_attention.Fp_linear1.weight') == True
+        assert warmup._is_warmup_trainable('layers.0.partial_attn_norm.weight') == True
+        
+        # Should NOT match
+        assert warmup._is_warmup_trainable('layers.0.attention.weight') == False
+        assert warmup._is_warmup_trainable('embeddings.weight') == False
+        assert warmup._is_warmup_trainable('lm_head.weight') == False
+        assert warmup._is_warmup_trainable('layers.0.mlp.weight') == False
+    
+    def test_apply_warmup_freeze(self):
+        """apply_warmup_freeze should freeze backbone and keep partial_attention trainable."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        warmup = PartialAttentionWarmup(warmup_steps=100)
+        
+        frozen_count, trainable_count = warmup.apply_warmup_freeze(model)
+        
+        assert frozen_count > 0
+        assert trainable_count > 0
+        
+        # Check that partial attention params are trainable
+        for name, param in model.named_parameters():
+            if warmup._is_warmup_trainable(name):
+                assert param.requires_grad == True, f"{name} should be trainable"
+            else:
+                assert param.requires_grad == False, f"{name} should be frozen"
+    
+    def test_apply_warmup_freeze_idempotent(self):
+        """apply_warmup_freeze should be idempotent (calling twice has no effect)."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        warmup = PartialAttentionWarmup(warmup_steps=100)
+        
+        frozen1, trainable1 = warmup.apply_warmup_freeze(model)
+        frozen2, trainable2 = warmup.apply_warmup_freeze(model)
+        
+        # Second call should return 0, 0 (no-op)
+        assert frozen2 == 0
+        assert trainable2 == 0
+    
+    def test_end_warmup_restores_params(self):
+        """end_warmup should restore original requires_grad states."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        warmup = PartialAttentionWarmup(warmup_steps=100)
+        
+        # Store original states
+        original_states = {name: param.requires_grad 
+                         for name, param in model.named_parameters()}
+        
+        # Apply warmup freeze
+        warmup.apply_warmup_freeze(model)
+        
+        # End warmup
+        restored_count = warmup.end_warmup(model)
+        
+        assert restored_count > 0
+        
+        # Check all params are restored
+        for name, param in model.named_parameters():
+            assert param.requires_grad == original_states[name], \
+                f"{name} should be restored to {original_states[name]}"
+    
+    def test_end_warmup_before_apply_noop(self):
+        """end_warmup before apply_warmup_freeze should be a no-op."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        warmup = PartialAttentionWarmup(warmup_steps=100)
+        
+        restored_count = warmup.end_warmup(model)
+        
+        assert restored_count == 0
+    
+    def test_get_warmup_params(self):
+        """get_warmup_params should return only partial attention parameters."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        warmup = PartialAttentionWarmup(warmup_steps=100)
+        
+        params = warmup.get_warmup_params(model)
+        
+        # Should have params (partial_attention and partial_attn_norm)
+        assert len(params) > 0
+        
+        # Verify all returned params match warmup patterns
+        param_names = {name for name, _ in model.named_parameters()}
+        for param in params:
+            # Find matching name by comparing data
+            found = False
+            for name, p in model.named_parameters():
+                if p is param:
+                    assert warmup._is_warmup_trainable(name), \
+                        f"{name} should match warmup pattern"
+                    found = True
+                    break
+            assert found, "Returned param should exist in model"
+    
+    def test_create_warmup_optimizer(self):
+        """create_warmup_optimizer should create optimizer with warmup params only."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        warmup = PartialAttentionWarmup(warmup_steps=100, warmup_lr=1e-3)
+        
+        optimizer = warmup.create_warmup_optimizer(model)
+        
+        assert optimizer is not None
+        assert len(optimizer.param_groups) == 1
+        assert optimizer.param_groups[0]['lr'] == 1e-3
+        
+        # Check param count matches get_warmup_params
+        expected_params = warmup.get_warmup_params(model)
+        actual_params = list(optimizer.param_groups[0]['params'])
+        assert len(actual_params) == len(expected_params)
+    
+    def test_get_progress(self):
+        """get_progress should return correct fraction."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=True)
+        
+        assert warmup.get_progress(0) == 0.0
+        assert warmup.get_progress(50) == 0.5
+        assert warmup.get_progress(100) == 1.0
+        assert warmup.get_progress(200) == 1.0  # Capped at 1.0
+    
+    def test_get_progress_disabled(self):
+        """get_progress should return 1.0 when disabled."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=False)
+        
+        assert warmup.get_progress(0) == 1.0
+        assert warmup.get_progress(50) == 1.0
+    
+    def test_format_status(self):
+        """format_status should return human-readable status."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=True)
+        
+        status = warmup.format_status(50)
+        assert "50/100" in status
+        assert "50.0%" in status
+    
+    def test_format_status_disabled(self):
+        """format_status should indicate disabled state."""
+        warmup = PartialAttentionWarmup(warmup_steps=100, enabled=False)
+        
+        status = warmup.format_status(50)
+        assert "disabled" in status.lower()
+
+
+# Tests: get_partial_attention_param_count
+class TestGetPartialAttentionParamCount:
+    """Tests for get_partial_attention_param_count utility function."""
+    
+    def test_counts_partial_attention_qkv(self):
+        """Should count partial_attention query/key/value params."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        counts = get_partial_attention_param_count(model)
+        
+        # Each layer has query, key, value (32*32 + 32 bias each)
+        # 2 layers * 3 projections * (32*32 + 32) = 2 * 3 * 1056 = 6336
+        # But our test model doesn't have biases, so: 2 * 3 * 1024 = 6144
+        assert counts['partial_attention_qkv'] > 0
+    
+    def test_counts_partial_attention_dense(self):
+        """Should count partial_attention dense params."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        counts = get_partial_attention_param_count(model)
+        
+        assert counts['partial_attention_dense'] > 0
+    
+    def test_counts_fp_network(self):
+        """Should count Fp network params."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        counts = get_partial_attention_param_count(model)
+        
+        assert counts['fp_network'] > 0
+    
+    def test_counts_partial_attn_norm(self):
+        """Should count partial_attn_norm params."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        counts = get_partial_attention_param_count(model)
+        
+        # 2 layers * 32 (norm weight) = 64
+        assert counts['partial_attn_norm'] > 0
+    
+    def test_total_partial_sum(self):
+        """total_partial should be sum of component counts."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        counts = get_partial_attention_param_count(model)
+        
+        expected_total = (
+            counts['partial_attention_qkv'] +
+            counts['partial_attention_dense'] +
+            counts['fp_network'] +
+            counts['partial_attn_norm']
+        )
+        assert counts['total_partial'] == expected_total
+    
+    def test_total_model_includes_all(self):
+        """total_model should be greater than total_partial."""
+        model = PALMStyleTestModel(hidden_size=32, num_layers=2)
+        counts = get_partial_attention_param_count(model)
+        
+        assert counts['total_model'] > counts['total_partial']
+
+
 # Integration Tests
 class TestTrainingIntegration:
     """Integration tests for training utilities working together."""
@@ -742,6 +1081,8 @@ def run_all_tests():
         TestLossSpikeDetector,
         TestDynamicSAEWeight,
         TestFreezeBackbone,
+        TestPartialAttentionWarmup,
+        TestGetPartialAttentionParamCount,
         TestTrainingIntegration,
     ]
     

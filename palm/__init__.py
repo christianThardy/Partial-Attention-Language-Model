@@ -1,7 +1,16 @@
 from .config import PALMConfig
 from .model import PALMModel, transfer_weights_to_palm, bootstrap_palm_components
 from .data import load_and_split_dataset, preprocess_function, create_data_loaders
-from .training import PALMTrainer, collate_fn, apply_lora, apply_qlora, maybe_apply_lora
+from .training import (
+    PALMTrainer, 
+    collate_fn, 
+    apply_lora, 
+    apply_qlora, 
+    maybe_apply_lora,
+    # Partial Attention Warmup (Enc-Dec Gemma style)
+    PartialAttentionWarmup,
+    get_partial_attention_param_count,
+)
 
 # Optional imports that require additional dependencies
 try:
