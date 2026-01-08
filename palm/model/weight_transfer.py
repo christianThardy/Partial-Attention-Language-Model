@@ -2,7 +2,7 @@
 Weight Transfer Utilities for PALM
 
 Supports transferring pretrained weights from various HuggingFace models
-(Llama, Qwen, Mistral, Phi, Gemma, Falcon, etc.) to PALMModel architecture.
+(Llama, Qwen, Mistral, Phi, Gemma, Falcon, Seed/Hermes, etc.) to PALMModel architecture.
 
 Key features:
 - Transfers RoPE (Rotary Position Embeddings) inv_freq for preserving positional understanding
@@ -30,7 +30,7 @@ def detect_model_architecture(model_name_or_config: Union[str, "PretrainedConfig
     Detect the architecture type from a model name or config.
     
     Returns:
-        Architecture family identifier: 'llama', 'qwen', 'mistral', 'phi', 'gemma', 'falcon'
+        Architecture family identifier: 'llama', 'qwen', 'mistral', 'phi', 'gemma', 'falcon', 'seed'
     """
     if isinstance(model_name_or_config, str):
         config = AutoConfig.from_pretrained(model_name_or_config, trust_remote_code=True)
@@ -42,6 +42,10 @@ def detect_model_architecture(model_name_or_config: Union[str, "PretrainedConfig
     
     if 'llama' in arch or any('llama' in a.lower() for a in architectures):
         return 'llama'
+    elif 'seed' in arch or any('seed' in a.lower() for a in architectures):
+        # ByteDance Seed architecture (used by NousResearch Hermes 4.x)
+        # Uses Llama-compatible weight structure with minor differences
+        return 'seed'
     elif 'qwen' in arch or any('qwen' in a.lower() for a in architectures):
         return 'qwen'
     elif 'mistral' in arch or any('mistral' in a.lower() for a in architectures):
@@ -71,7 +75,7 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
     """
     mapping = {}
     
-    if arch_type in ['llama', 'mistral', 'gemma']:
+    if arch_type in ['llama', 'mistral', 'gemma', 'seed']:
         # Embeddings and LM head
         mapping['model.embed_tokens.weight'] = 'embeddings.word_embeddings.weight'
         mapping['lm_head.weight'] = 'lm_head.weight'
@@ -88,6 +92,13 @@ def get_weight_mapping(arch_type: str, num_layers: int) -> Dict[str, Optional[st
             mapping[f'{src_prefix}.self_attn.k_proj.weight'] = f'{dst_prefix}.attention.key.weight'
             mapping[f'{src_prefix}.self_attn.v_proj.weight'] = f'{dst_prefix}.attention.value.weight'
             mapping[f'{src_prefix}.self_attn.o_proj.weight'] = f'{dst_prefix}.attention.dense.weight'
+            
+            # Seed/Hermes models have attention_bias=True, handle bias weights
+            if arch_type == 'seed':
+                mapping[f'{src_prefix}.self_attn.q_proj.bias'] = f'{dst_prefix}.attention.query.bias'
+                mapping[f'{src_prefix}.self_attn.k_proj.bias'] = f'{dst_prefix}.attention.key.bias'
+                mapping[f'{src_prefix}.self_attn.v_proj.bias'] = f'{dst_prefix}.attention.value.bias'
+                # Note: Seed has attention_out_bias=False, so no o_proj bias
             
             # Pre-attention norm → PALM's attn_norm (RMSNorm)
             mapping[f'{src_prefix}.input_layernorm.weight'] = f'{dst_prefix}.attn_norm.weight'
@@ -192,7 +203,7 @@ def _get_rope_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str]:
     """
     i = layer_idx
     
-    if arch_type in ['llama', 'mistral', 'gemma']:
+    if arch_type in ['llama', 'mistral', 'gemma', 'seed']:
         return {
             'inv_freq': f'model.layers.{i}.self_attn.rotary_emb.inv_freq',
         }
@@ -412,7 +423,7 @@ def _get_attention_key_patterns(arch_type: str, layer_idx: int) -> Dict[str, str
     """Get source attention key patterns for a given architecture."""
     i = layer_idx
     
-    if arch_type in ['llama', 'mistral', 'gemma']:
+    if arch_type in ['llama', 'mistral', 'gemma', 'seed']:
         return {
             'q': f'model.layers.{i}.self_attn.q_proj.weight',
             'k': f'model.layers.{i}.self_attn.k_proj.weight',

@@ -16,7 +16,7 @@ This creates a stable channel for conditioning on prompt instructions, system co
 
 This PALM implementation operationalizes and modernizes research that re-interprets decoder-only architectures as regularized encoder-decoders (Fu et al.), but for autoregressive chat models. 
 
-By treating PALM as an architectural wrapper, partial attention mechanisms are integrated into existing dense, open-weights (Llama, Mistral, Qwen, etc.) while preserving their fundamental learned representations.
+By treating PALM as an architectural wrapper, partial attention mechanisms are integrated into existing dense, open-weights (Llama, Mistral, Qwen, Hermes, etc.) while preserving their fundamental learned representations.
 
 PALM enhances standard decoder-only models by introducing:
 
@@ -96,7 +96,7 @@ PALM doesn't train from scratch, it bootstraps from any compatible open-weight m
 ```python
 from palm import PALMModel, PALMConfig, transfer_weights_to_palm
 
-# Supports: Llama, Qwen, Mistral, Phi, Gemma, Falcon, etc
+# Supports: Llama, Qwen, Mistral, Phi, Gemma, Falcon, Hermes/Seed
 model = PALMModel(PALMConfig(base_model_name="Qwen/Qwen2.5-3B"))
 model = transfer_weights_to_palm(model, "NousResearch/Hermes-4.3-36B")
 ```
