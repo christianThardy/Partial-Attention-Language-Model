@@ -42,7 +42,7 @@ PALM enhances standard decoder-only models by introducing:
 
 ---
 
-## Start training in 10 Minutes
+## Start fine-tuning in 10 Minutes
 
 ```bash
 # Clone and install
@@ -50,7 +50,7 @@ git clone https://github.com/christianThardy/Partial-Attention-Language-Model.gi
 cd Partial-Attention-Language-Model
 pip install torch transformers peft bitsandbytes wandb tqdm safetensors datasets
 
-# Run the training notebook
+# Run the notebook
 jupyter notebook notebooks/finetune_palm.ipynb
 ```
 
@@ -162,7 +162,7 @@ from palm.evaluation import (
     SourceAblationEvaluator,
 )
 
-# Lightweight evaluation during training
+# Lightweight evaluation during fine-tuning
 evaluator = StaggeredEvaluator(model, tokenizer)
 results = evaluator.evaluate(eval_samples)
 
