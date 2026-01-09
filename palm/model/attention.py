@@ -527,6 +527,10 @@ class PALMPartialAttention(nn.Module):
             Pl2 = self.Fp_dropout2(Pl2)
             P = Pl2 + Pl1  # Residual connection as per paper
             
+            # Clamp Fp output to prevent extreme values during warmup
+            # This prevents attention score overflow while Fp is learning
+            P = torch.clamp(P, min=-100.0, max=100.0)
+            
             # Project to num_kv_heads (not num_attention_heads) for GQA
             key_layer = self.transpose_for_scores(self.key(P), self.num_kv_heads)
             value_layer = self.transpose_for_scores(self.value(P), self.num_kv_heads)
@@ -577,5 +581,14 @@ class PALMPartialAttention(nn.Module):
         # Output projection (NO residual connection here - Pre-Norm does it outside)
         attention_output = self.dense(context_layer)
         attention_output = self.resid_dropout(attention_output)
+    
+        # Guard for non-finite values (can occur during warmup with fresh Fp weights)
+        if not torch.isfinite(attention_output).all():
+            attention_output = torch.where(
+                torch.isfinite(attention_output),
+                attention_output,
+                torch.zeros_like(attention_output)
+            )
+            logger.warning("Non-finite values detected in partial attention output, zeroing them")
     
         return attention_output, present_key_value

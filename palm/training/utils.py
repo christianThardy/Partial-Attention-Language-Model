@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 # 1. Freeze everything EXCEPT partial_attention.* and Fp_* for K steps
 # 2. Train only these components with a focused learning rate
 # 3. After warmup, unfreeze and proceed with normal training
+#
+# IMPORTANT: Warmup LR Guidelines
+# - Default 1e-4 is conservative and safe
+# - 5e-4 can cause instability (NaN/Inf in attention) during early steps
+# - If you see "Non-finite values" warnings, REDUCE warmup_lr
+# - The Fp network is particularly sensitive to high LR since it transforms
+#   source states before they go through K/V projections
 
 class PartialAttentionWarmup:
     """
@@ -26,8 +33,11 @@ class PartialAttentionWarmup:
     This allows the PALM-specific components to learn coherent representations
     before the pretrained backbone starts updating, preventing instability.
     
+    IMPORTANT: Use warmup_lr <= 1e-4 to avoid numerical instability.
+    Higher LR (e.g., 5e-4) can cause NaN/Inf in early training steps.
+    
     Usage:
-        warmup = PartialAttentionWarmup(model, warmup_steps=500, warmup_lr=5e-4)
+        warmup = PartialAttentionWarmup(warmup_steps=500, warmup_lr=1e-4)
         
         for step in training_loop:
             # Check phase and get appropriate parameters
@@ -55,13 +65,15 @@ class PartialAttentionWarmup:
     def __init__(
         self,
         warmup_steps: int = 500,
-        warmup_lr: float = 5e-4,
+        warmup_lr: float = 1e-4,
         enabled: bool = True,
     ):
         """
         Args:
             warmup_steps: Number of steps to run partial attention warmup
-            warmup_lr: Learning rate for warmup phase (typically higher since focused)
+            warmup_lr: Learning rate for warmup phase. Default 1e-4 is conservative.
+                      CAUTION: Values > 2e-4 can cause NaN/Inf in attention during
+                      early steps. If you see "Non-finite values" warnings, reduce this.
             enabled: Whether warmup is active (False to skip entirely)
         """
         self.warmup_steps = warmup_steps

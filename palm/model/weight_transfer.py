@@ -568,7 +568,23 @@ def bootstrap_palm_components(
         logger.info(f"✓ Cloned attn_norm to partial_attn_norm for {norm_bootstrapped} layers")
     
     # 3. Fp NETWORK ← IDENTITY-LIKE INITIALIZATION
+    # Goal: Fp(x) ≈ x initially, so partial attention starts coherent
+    # 
+    # The Fp network is: P = Fp_linear2(SiLU(Fp_linear1(x))) + SiLU(Fp_linear1(x))
+    # For identity-like behavior, we need SiLU(Fp_linear1(x)) ≈ x
+    # 
+    # SiLU(x) = x * sigmoid(x) ≈ x for x >> 0, but ≈ 0 for x << 0
+    # For normalized hidden states (mean ≈ 0), half values get squashed!
+    #
+    # Solution: Scale up Fp_linear1 so SiLU doesn't dampen too much.
+    # With Fp_linear1 ≈ 1.7*I, SiLU(1.7*x) ≈ x for typical normalized inputs.
+    # Then Fp_linear2 ≈ 0 gives P = 0 + SiLU(1.7*x) ≈ x
+    #
+    # Also add very small noise for symmetry breaking.
     fp_initialized = 0
+    FP_SCALE = 1.7  # Compensates for SiLU dampening on normalized inputs
+    FP_NOISE = 0.001  # Small noise for symmetry breaking
+    
     for i in range(num_layers):
         fp_prefix = f'layers.{i}.partial_attention'
         
@@ -579,13 +595,16 @@ def bootstrap_palm_components(
             device = weight.device
             dtype = weight.dtype
             
-            identity_like = torch.eye(hidden_size, device=device, dtype=dtype)
-            palm_state[fp1_key] = 0.01 * torch.randn_like(weight) + 0.1 * identity_like
+            # Scaled identity + tiny noise
+            identity_scaled = FP_SCALE * torch.eye(hidden_size, device=device, dtype=dtype)
+            noise = FP_NOISE * torch.randn_like(weight)
+            palm_state[fp1_key] = identity_scaled + noise
             fp_initialized += 1
         
         fp2_key = f'{fp_prefix}.Fp_linear2.weight'
         if fp2_key in palm_state:
-            palm_state[fp2_key] = torch.zeros_like(palm_state[fp2_key])
+            # Zero init for Fp_linear2 so P ≈ Pl1
+            palm_state[fp2_key] = FP_NOISE * torch.randn_like(palm_state[fp2_key])
             fp_initialized += 1
         
         for bias_key in [f'{fp_prefix}.Fp_linear1.bias', f'{fp_prefix}.Fp_linear2.bias']:
